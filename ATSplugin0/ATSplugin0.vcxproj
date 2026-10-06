@@ -158,11 +158,13 @@
     </Manifest>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="ATO.h" />
     <ClInclude Include="atsplugin.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="Tasc.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="ATO.cpp" />
     <ClCompile Include="Ats.cpp" />
     <ClCompile Include="CsAtc.cpp" />
     <ClCompile Include="Tasc.cpp" />

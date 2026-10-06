@@ -6,6 +6,7 @@
 #include "atsplugin.h"
 #include "Tasc.h"
 #include <stdio.h>
+#include <time.h>
 
 // --- 外部ファイル（CsAtc.cpp）にある関数を宣言 ---
 extern int GetCsAtcSpeed(int signal);
@@ -13,6 +14,7 @@ extern int GetCsAtcSpeed(int signal);
 // --- 地上子タイプ定義 ---
 const int BEACON_TYPE_LINE_CHECK = 20; // 号線照合用地上子のType番号
 const int BEACON_TYPE_ADVANCE_NOTICE = 31;  // 前方予告用地上子 (21 -> 31へ修正)
+const float TASC_DECEL_MS2 = 0.6944f;        // 目標減速度 (既定2.5 km/h/s)
 
 // --- グローバル変数 ---
  // 現在の閉塞から取得したATC制限速度 (km/h)
@@ -111,6 +113,12 @@ const int BEACON_SPEEDLIMIT = 1007; //速度制限
 bool s_isTascActive = false; //TASC制御中かどうか
 int g_extendedNotches = 0; //拡張ノッチ段数　INIファイル対応
 int g_pressureRatesCount = 0; //圧力比率テーブルの要素数
+bool g_TASC_Failure = false; //TASC故障フラグ　trueで故障
+float g_TASC_FailureRate = 0.0f; //TASC故障率　0.0～1.0の範囲で設定可能
+bool g_TASC_FailureActive = false; //TASC故障中かどうか INIファイル対応　trueで故障中
+bool g_ATO_Failure = false; //ATO故障フラグ　trueで故障
+bool g_ATO_FailureActive = false; //ATO故障中かどうか INIファイル対応　trueで故障中
+float g_ATO_FailureRate = 0.0f; //ATO故障率　0.0～1.0の範囲で設定可能
 
 // このDLL自体のインスタンスハンドルを保持する変数
 HINSTANCE g_hModule = NULL;
@@ -150,6 +158,7 @@ int CountCommaSeparatedElements(const char* str) {
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
     if (fdwReason == DLL_PROCESS_ATTACH) {
+		srand((unsigned int)time(NULL)); // 乱数の初期化
         char dllPath[MAX_PATH];
         char iniPath[MAX_PATH];
 
@@ -274,6 +283,90 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
             ExitProcess(1);
             return FALSE;
         }
+		// --TASC故障関連パラメータの読み込み--
+		char failurebuf[32] = { 0 };
+		GetPrivateProfileStringA("TASC", "Failure", "false", failurebuf, sizeof(failurebuf), iniPath);
+        if (_stricmp(failurebuf, "true") == 0) {
+            g_TASC_FailureActive = true;
+        }
+		else {
+			g_TASC_FailureActive = false;
+		}
+		GetPrivateProfileStringA("TASC", "FailureRate", "0.0", failurebuf, sizeof(failurebuf), iniPath);
+		g_TASC_FailureRate = (float)atof(failurebuf);
+		if (g_TASC_FailureRate < 0.0f) { // 0.0未満は無効として0.0に丸める
+			g_TASC_FailureActive = false; // 故障率が無効な場合は故障を無効化
+			g_TASC_FailureRate = 0.0f; // 故障率を0.0にset
+        }
+        else {
+			if (g_TASC_FailureRate == 0.0000001f) { // 0.0000001% (0.000000001) 未満は計算発散回避のためアプリ終了
+				MessageBoxA(
+					NULL,
+					"ATS.ini の [TASC] FailureRate 設定値が無効です。\n"
+					"値が小さすぎるためプラグインを読み込めません。(許容値: 0.0000001 以上)\n\n"
+					"設定値を確認してください。",
+					"エラー",
+					MB_OK | MB_ICONERROR | MB_TOPMOST
+				);
+				ExitProcess(1);
+			}
+			if (g_TASC_FailureRate > 1.0f) { // 1.0を超えている場合は1.0未満に丸める
+				g_TASC_FailureRate = 1.0f;
+				MessageBoxA(
+					NULL,
+					"ATS.ini の [TASC] FailureRate 設定値が無効です。\n"
+					"値が大きすぎます。(許容値: 1.00 以下)\n\n"
+					"設定値を確認してください。OKをクリックすると100%に読み替えて続行します。",
+					"警告",
+					MB_OK | MB_ICONWARNING | MB_TOPMOST
+				);
+			}
+            
+        }
+		// --ATO故障関連パラメータの読み込み-- 実装は10月下旬。ここではダミーとして読み込むだけにする。
+		char ATOfailurebuf[32] = { 0 };
+		GetPrivateProfileStringA("ATO", "Failure", "false", ATOfailurebuf, sizeof(ATOfailurebuf), iniPath);
+		if (_stricmp(ATOfailurebuf, "true") == 0) {
+			g_ATO_FailureActive = true;
+		}
+		else {
+			g_ATO_FailureActive = false;
+		}
+		GetPrivateProfileStringA("ATO", "FailureRate", "0.0", ATOfailurebuf, sizeof(ATOfailurebuf), iniPath);
+		g_ATO_FailureRate = (float)atof(ATOfailurebuf);
+		if (g_ATO_FailureRate < 0.0f) { // 0.0未満は無効として0.0に丸める
+			g_ATO_FailureActive = false; // 故障率が無効な場合は故障を無効化
+			g_ATO_FailureRate = 0.0f; // 故障率を0.0にset
+		}
+		else {
+			if (g_ATO_FailureRate == 0.0000001f) { // 0.0000001% (0.000000001) 未満は計算発散回避のためアプリ終了
+				MessageBoxA(
+					NULL,
+					"ATS.ini の [ATO] FailureRate 設定値が無効です。\n"
+					"値が小さすぎるためプラグインを読み込めません。(許容値: 0.0000001 以上)\n\n"
+					"設定値を確認してください。"
+                    "ダミー",
+					"エラー",
+					MB_OK | MB_ICONERROR | MB_TOPMOST
+				);
+				ExitProcess(1);
+			}
+			if (g_ATO_FailureRate > 1.0f) { // 1.0を超えている場合は1.OTHに丸める
+				g_ATO_FailureRate = 1.0f;
+				MessageBoxA(
+					NULL,
+					"ATS.ini の [ATO] FailureRate 設定値が無効です。\n"
+					"値が大きすぎます。(許容値: 1.0 以下)\n\n"
+					"設定値を確認してください。OKをクリックすると100%に読み替えて続行します。"
+                    "ダミー",
+					"警告",
+					MB_OK | MB_ICONWARNING | MB_TOPMOST
+				);
+			}
+
+		}
+        //TASC_DECEL_MS2 = GetPrivateProfileStringA("TASC", "deceleration","2.5",iniPath);
+
     }
     return TRUE;
 }
@@ -319,7 +412,7 @@ ATS_API void WINAPI Load()
     g_brake67Notch = 0;
     g_cars = 0;
 	g_pressureRatesCount = 0;
-
+	g_TASC_Failure = false; //TASC故障フラグ　trueで故障
 
     // 現在選択されているアクティブなATCモード (false = WS-ATC, true = CS-ATC) 初期化
     if (g_atcTypeSetting == 1) {
@@ -653,7 +746,7 @@ ATS_API void WINAPI KeyDown(int key)
             if (g_TASCATOSet > 2) {
                 g_TASCATOSet = 0;
             }
-
+            
             // モード切替時にTASCの内部状態をリセット
             InitTasc();
         }
@@ -768,7 +861,6 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
                 outputBrake = tascBrake;
             }
         }
-
         // 運転士ノッチによる通常の出力（制限速度内での運転）を許可
         else {
             outputBrake = g_driverBrake;
@@ -848,11 +940,10 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
         panel[PANEL_TASC_NOTCH] = GetCurrentTascBrakeNotch();
     }
 
-    // 定点停止灯 (PilotLamp: 0 または 1)
+    // 定点停止灯 (PilotLamp): 故障中は 0 (消灯)
     if (PANEL_POSITION_ENABLE >= 0 && PANEL_POSITION_ENABLE < 256) {
-        panel[PANEL_POSITION_ENABLE] = g_PositionEnable ? 1 : 0;
+        panel[PANEL_POSITION_ENABLE] = (g_PositionEnable && !g_TASC_Failure) ? 1 : 0;
     }
-
 
 	panel[1] = g_isOverrideMode ? 1 : 0; // 非設をONにしているかどうかを出力
 	panel[2] = g_isAtcPowerOn ? 1 : 0; // ATC電源がONかOFFかを出力
@@ -959,6 +1050,14 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
             panel[51] = g_isAtcEmergencyBrake ? 1 : 0;
             panel[50] = 0;   // ATC常用 (0:非表示, 1:点灯)
 
+        }
+		if (g_TASC_Failure) {
+			panel[134] = 0; // TASCモード表示灯 (1:点灯)
+			panel[135] = 1; // TASC故障表示灯 (1:点灯)
+		}
+        else
+        {
+			panel[135] = 0; // TASC故障表示灯 (1:点灯)
         }
     }
     if (g_shouldPlayBell) {

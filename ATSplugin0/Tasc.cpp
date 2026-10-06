@@ -12,13 +12,12 @@ static int s_lastTimeMs = -1; // 前回のフレーム時刻 (ms)
 static int s_notchTimerMs = 0; // ノッチ変化タイマー (ms)
 static float s_targetLocation = -1.0f;   // 目標停止位置 (m)
 static float s_stopTolerance = 0.5f;     // 許容範囲 (m) 既定値: ±50cm (0.5m)
-static float s_pendingRelativeDist = -1.0f;
+static float s_pendingRelativeDist = -1.0f; // 保留中の相対距離 (m) -1.0f で保留なしを示す
 
-static const float TASC_DECEL_MS2 = 0.6944f;        // 目標減速度 (2.5 km/h/s)
 static const float TASC_DELAY_TIME_SEC = 1.0f;     // 空走時間 (秒)
 static const int NOTCH_STEP_INTERVAL_MS = 100;     // 100msランプアップ
 
-void InitTasc() { // TASC内部状態の初期化
+void InitTasc() { // TASC内部状態の初期化　★g_TASC_Failureはリセットしない（故障状態を保持するため）
     s_isTascActive = false;
     s_targetLocation = -1.0f;
     s_pendingRelativeDist = -1.0f;
@@ -58,6 +57,7 @@ void ProcessTascBeacon(int type, int optional) {
     }
 }
 // ドアが開いたらTASCをリセットする
+// g_TASCFailure変数は故障状態を保持するため、リセットしない
 void OnDoorOpen() {
     s_isTascActive = false;
     s_targetLocation = -1.0f;
@@ -67,10 +67,50 @@ void OnDoorOpen() {
     s_notchTimerMs = 0;
     g_PositionEnable = false;
 }
+// TASC故障を発生させる内部関数
+void TriggerTascFailure() {
+    g_TASC_Failure = true;
+    s_isTascActive = false;
+    s_currentTascBrake = 0;
+    g_PositionEnable = false;
+}
 
+// 確率判定ロジック (0.0〜1.0 の設定値に基づく)
+bool CheckRandomFailure() {
+    if (!g_TASC_FailureActive || g_TASC_FailureRate <= 0.0f) return false;
+    if (g_TASC_FailureRate >= 1.0f) return true; // 確率1.0なら確実に故障
+
+    // 0.0 〜 1.0 の乱数を生成して比較
+    float randVal = (float)rand() / (float)RAND_MAX;
+    return (randVal < g_TASC_FailureRate);
+}
+// TASCスイッチの切り替え処理
+void OnTascSwitchToggled(int newState) {
+    g_TASCATOSet = newState; // 0: 切, 1: 入
+
+    // 既に故障している状態で「入」に戻された場合
+    if (g_TASC_Failure && g_TASCATOSet != 0) {
+        // 次の Elapse から自動的に非常ブレーキが割り込みます
+        g_PositionEnable = false;
+    }
+}
 // TASCブレーキ演算処理
 int CalculateTascBrake(float currentLocation, float currentSpeed, int driverBrake, int currentTimeMs) {
-    if (currentLocation <= 0.0f) return driverBrake;
+
+	// 故障判定
+	if (g_TASC_Failure) {
+		s_currentTascBrake = 0; // 故障中はTASC制御を無効化
+		s_isTascActive = false; // 故障中はTASC制御を無効化
+		g_PositionEnable = false; // 故障中は定点停止灯を消灯
+        if (g_TASCATOSet != 0) {
+            int ebNotch = g_maxBrakeNotch + 1; // 非常ブレーキノッチ
+            return (driverBrake > ebNotch) ? driverBrake : ebNotch; // 故障中は非常ブレーキを掛ける
+        }
+        else {
+			return driverBrake; // 故障中はTASC制御を無効化
+        }
+	}
+	if (currentLocation <= 0.0f) return driverBrake; // 現在位置が不明な場合はTASC制御を無効化
 
     int deltaTimeMs = 0;
     if (s_lastTimeMs >= 0) {
@@ -92,6 +132,17 @@ int CalculateTascBrake(float currentLocation, float currentSpeed, int driverBrak
         s_currentTascBrake = 0;
         return driverBrake;
     }
+	// TASC作動中の故障判定
+	static bool s_wasTascActiveLastFrame = false;
+	if (s_isTascActive && !s_wasTascActiveLastFrame) {
+		if (CheckRandomFailure()) {
+			TriggerTascFailure(); // 故障を発生させる
+			s_wasTascActiveLastFrame = false; // 故障発生後はフラグをリセット
+			int ebNotch = g_maxBrakeNotch + 1; // 非常ブレーキノッチ
+			return (driverBrake > ebNotch) ? driverBrake : ebNotch; // 故障時は非常ブレーキを掛ける
+		}
+	}
+	s_wasTascActiveLastFrame = s_isTascActive;
 
     int effectiveMaxNotch = GetEffectiveMaxNotch();
     float remainingDistance = s_targetLocation - currentLocation;
@@ -254,7 +305,7 @@ int CalculateTascBrake(float currentLocation, float currentSpeed, int driverBrak
     // 現在出力中のTASCノッチ段数（0〜14）を返す関数
     int GetCurrentTascBrakeNotch() {
         // TASC非作動・電源OFF時は 0 表示
-        if (!s_isTascActive || g_TASCATOSet == 0 || !g_isAtcPowerOn) {
+        if (!s_isTascActive || g_TASCATOSet == 0 || !g_isAtcPowerOn || g_TASC_Failure) {
             return 0;
         }
         return s_currentTascBrake;
