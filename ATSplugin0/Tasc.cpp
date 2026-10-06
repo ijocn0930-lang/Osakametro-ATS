@@ -305,7 +305,7 @@ int CalculateTascBrake(float currentLocation, float currentSpeed, int driverBrak
     // 現在出力中のTASCノッチ段数（0〜14）を返す関数
     int GetCurrentTascBrakeNotch() {
         // TASC非作動・電源OFF時は 0 表示
-        if (!s_isTascActive || g_TASCATOSet == 0 || !g_isAtcPowerOn || g_TASC_Failure) {
+        if (!s_isTascActive || g_TASCATOSet == 0 || !g_isAtcPowerOn) {
             return 0;
         }
         return s_currentTascBrake;

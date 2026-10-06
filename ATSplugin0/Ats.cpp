@@ -1001,10 +1001,13 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
         }
         else {
             panel[0] = g_csLimitSpeed; // デジタル車内信号速度 (数値)
-            panel[33] = g_isAdvanceNoticeActive ? 1 : 0; // 前方予告灯
             panel[50] = g_isAtcServiceBrake ? 1 : 0;   // ATC常用 (0:非表示, 1:点灯)
             panel[51] = g_isAtcEmergencyBrake ? 1 : 0; // ATC非常 (0:非表示, 1:点灯)
             // 号線不一致の場合：非常/絶対停止 (panel[10]) を消灯し、開通表示灯は消灯
+     if (g_isAdvanceNoticeActive) {
+        panel[33] = 1; // 前方予告作動中フラグを点灯
+    }
+
         if (g_isLineMismatch) {
             panel[0] = 0;
             panel[51] = 1; // ATC非常 (0:非表示, 1:点灯)
@@ -1046,18 +1049,11 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
     else {
         // WS-ATCモード時または電源OFF時は車内信号指示・表示灯をすべて消灯 (0)
         panel[0] = 0;
+        panel[33] = 0; // 前方予告作動中フラグを消灯
         if (g_isAtcFailed) {
             panel[51] = g_isAtcEmergencyBrake ? 1 : 0;
             panel[50] = 0;   // ATC常用 (0:非表示, 1:点灯)
 
-        }
-		if (g_TASC_Failure) {
-			panel[134] = 0; // TASCモード表示灯 (1:点灯)
-			panel[135] = 1; // TASC故障表示灯 (1:点灯)
-		}
-        else
-        {
-			panel[135] = 0; // TASC故障表示灯 (1:点灯)
         }
     }
     if (g_shouldPlayBell) {
@@ -1082,6 +1078,7 @@ ATS_API void WINAPI Initialize(int key)
     g_speed = 0.0f; //速度が0になるため、誤作動対策でこのコードを記述する
 	if (g_isAtcPowerOn) {
 		g_isAtcPowerOn = false; // ATC電源をOFFにする
+        g_isAdvanceNoticeActive = false; // 前方予告作動中フラグをリセット
 		g_lastRawSignal = -1; // 信号インデックスを初期化（未受信状態）
 	}
 	InitTasc(); // TASCの内部状態をリセット
@@ -1089,6 +1086,7 @@ ATS_API void WINAPI Initialize(int key)
 		g_isInNagataStation = false; // 長田駅エリアフラグをリセット
 	}
 	g_isLineMismatch = false; // 号線不一致フラグをリセット
+	g_isAdvanceNoticeActive = false; // 前方予告作動中フラグをリセット
 	// 注意1：ATCFaildフラグはリセットしない（故障状態を保持するため）
 	// 注意2: g_isCurrentModeCS はリセットしない（現在のモードを保持するため）
 	// 注意3: g_isKeihan はリセットしない（現在のモードを保持するため）
