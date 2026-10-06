@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="ATSplugin0/ATSplugin0.vcxproj" Id="0f980fe1-5ba4-4d72-b013-6ca947393aca" />
+</Solution>
