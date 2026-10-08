@@ -299,7 +299,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 			g_TASC_FailureRate = 0.0f; // 故障率を0.0にset
         }
         else {
-			if (g_TASC_FailureRate == 0.0000001f) { // 0.0000001% (0.000000001) 未満は計算発散回避のためアプリ終了
+			if (g_TASC_FailureRate < 0.0000001f) { // 0.0000001% (0.000000001) 未満は計算発散回避のためアプリ終了
 				MessageBoxA(
 					NULL,
 					"ATS.ini の [TASC] FailureRate 設定値が無効です。\n"
