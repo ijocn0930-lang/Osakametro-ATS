@@ -1,16 +1,19 @@
 # ATSplugin0(Osakametro ATSプラグイン)
 ## 注意：このプラグインだけでは動きません。車両データに配置しなければなりません。
 
-#### 書きかけの項目があります。注意して利用してください。
+#### 書きかけの項目があります。
+
+必ずお読みください。
 
 ## このプラグインは何？
 これは、Osaka MetroのATSを再現するためのプラグインです。  
 ```Ats.dll```をAts32フォルダに配置しておきます。  
-Vehicle.txtに以下のように記述することで、Osaka MetroのATSを使用することができます。
+Vehicle.txtに以下のように記述することで、Osaka MetroのATSを使用することができます。  
+完全ではない場合があります。注意して使用してください。
 ```
 Ats32 = Ats32\Ats.dll
 ```
-**現在、64Bit版はありません。** BVE5をご利用ください。
+**現在、64bit版はありません。** BVE5をご利用ください。  
 もし、64bit版が追加された場合は以下のように記述してください。  
 **ATSプラグインを強制的に64bit**へブリッジすることを想定していません。
 ```
@@ -26,12 +29,18 @@ Ats64 = Ats64\Ats.dll
 WS-ATCは、地上信号機を用いたアナログ信号を使用します。信号機の色に応じて、速度制限を行います。  
 速度超過すると、警告音が鳴り、ブレーキがかかります。停止信号を冒進した場合は、非常ブレーキがかかります。
 近鉄モードに切り替えると95km/hまで運転可能です。  
-
+```
+Section.Begin(0, 1, 2, 3, 4); //0,25,40,50,70
+```
 
 ### CS-ATC
 千日前線や中央線などの一部の路線では、CS-ATCが使用されています。
 CS-ATCに切り替えたら、車内信号に従って運転します。速度が超過するとブレーキがかかります。  
 車内信号の速度が変化したらベルが鳴ります  
+```
+Section.Begin(10, 11, 15, 18, 20, 24); //02,01,25,40,50,70
+```
+信号インデックスは10以降です。10未満は境界駅でのバグ回避のため制限速度は無制限ですが、10未満の信号インデックスを指定しないでください。
 
 ### CS-ATC故障
 このプラグインは、CS-ATCの故障を再現することができます。CS-ATCが故障すると、車内信号が消灯し、非常ブレーキがかかります。
@@ -179,7 +188,7 @@ AtcType=2
 |~~|||||
 |43|||25km/h|構内モード(未使用)|
 
-CS-ATC信号インデックスにある10は02信号、11と12は01信号です。  
+CS-ATC信号インデックスにある10は02信号、11と12は01信号です。02信号は非常ブレーキ、01信号は常用ブレーキです。  
 **現在、OsakaMetroはアナログATCのため、5km/h刻みの現示はありませんが、将来5km/h刻みの現示に対応するための準備をしてあります。**  
 通常では0km/h,15km/h,25km/h,35km/h,40km/h,50km/h,60km/h,70km/h,95km/hのみ使用することをおすすめします。  
 互換性保持のため、今度100以降の信号インデックスにアナログATCの実装を予定しているかもしれません。
@@ -188,7 +197,46 @@ CS-ATC信号インデックスにある10は02信号、11と12は01信号です�
 |BeaconData.Type|BeaconData.Signal/Distance|BeaconData.Optinal|備考|  
 |-----|-----|-----|-----|  
 |31|1|0(使用しない)|前方予告受信地上子[^1]|
-|1030|0(使用しない)|距離(40000で400m先に停車位置)|停車位置地上子|
-|1031|0(使用しない)|50で前後50cm以内|停車許容範囲の設定|
+|1030|0(使用しない)|距離(40000で400m先に停車位置)|停車位置地上子 cm単位|
+|1031|0(使用しない)|50で前後50cm以内|停車許容範囲の設定 cm単位|
+|1003|0(使用しない)|使用しない|ATO自動発進 **未実装**|
+|1007|0(使用しない)|使用しない|速度制限識別 **未実装**|
+|1008|0(使用しない)|使用しない|こう配補正 **未実装**|
+
+
+
+
+### ライセンス
+本プラグインは**MIT License**のもとで公開されています。
+著作権者の提示とライセンス条文の同梱だけで誰にも改造、流用することができます。
+ただし、車両データに本プラグインが同梱された場合は車両データ側のライセンスが優先されます。
+
+---
+MIT License
+
+Copyright (c) 2026 ijocn0930-lang
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+
+
+
 
 [^1]:メトロ総合プラグインと互換性があります。信号が変化すると前方予告が消えてしまうため、大量の地上子を設置してください。

@@ -15,5 +15,9 @@ extern int g_ATOStart; //ATO発進するかどうか。ATOがオフの時は-1�
 extern bool g_ATO_Failure; //ATO故障フラグ　trueで故障
 extern bool g_ATO_FailureActive; //ATO故障中かどうか INIファイル対応　trueで故障中
 extern float g_ATO_FailureRate; //ATO故障率　0.0～1.0の範囲で設定可能
+extern bool g_ATOActive;
 void DisableATO(); //TASCが有効でないときは、ATOも無効化する
+void ATOPower(); //ATO力行指令構成
+void ATOBrake(); //ATO制動指令構成
+void InitATO(); //ATO初期化
 #endif // ATO_H

@@ -102,6 +102,7 @@ int g_Position = 0; //debug--停車位置までの距離 cm単位で1桁ずつ�
 bool g_PositionEnable = false; //停車位置の認識 手動でもtrueにする。ATC電源がオフの時は非表示
 int g_TASCBrakeNotch = 0; //TASC制御・ATO制動指令で使用するブレーキノッチ　0で運転士のノッチと同じ INIファイル対応　ATC電源がオフの時は非表示
 bool g_TASCControl = false; //TASC制御中かどうか　電源オフの時は非表示
+bool g_ATOActive = false; //ATOがアクティブかどうか。
 int g_ATOPower = 0; //ATO力行指令　0で運転士のノッチと同じ　INIファイル対応　ATC電源がオフの時は非表示
 int g_ATOStart = 0; //ATO発進するかどうか。ATOがオフの時は-1。0で手動、1で自動　ATC電源がオフの時は非表示
 bool g_inching = false; //オーバーランしたときにインチングします。（インチングはキー押下のみ手動）
