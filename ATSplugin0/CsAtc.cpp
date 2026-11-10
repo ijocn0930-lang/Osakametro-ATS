@@ -1,8 +1,4 @@
-﻿#include <windows.h>
-#include <stdlib.h>
-#include "atsplugin.h"
-
-// Ats.cpp側にある共通のグローバル変数を参照します いずれも未使用
+﻿// Ats.cpp側にある共通のグローバル変数を参照します いずれも未使用
 extern int g_maxBrakeNotch; // ブレーキ最大段数（iniから読み込み、0〜6の範囲で設定可能、初期値は6）
 extern bool g_isBuzzerPlaying; // ブザー鳴動中かどうかを記憶するフラグ
 

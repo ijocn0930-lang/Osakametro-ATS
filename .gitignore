@@ -361,3 +361,6 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+/ATSplugin0/Scenarios
+/ATSplugin0/TascLog.csv
+/TascLog.csv

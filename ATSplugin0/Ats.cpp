@@ -1,12 +1,11 @@
-﻿#include <windows.h>
-#include <stdlib.h>
-#include <math.h>
-#include <string.h>
-#include <vector>
-#include "atsplugin.h"
+﻿#include "ATO.h"
 #include "Tasc.h"
-#include <stdio.h>
+#include "atsplugin.h"
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
+#include <vector>
+#include <windows.h>
 
 // --- 外部ファイル（CsAtc.cpp）にある関数を宣言 ---
 extern int GetCsAtcSpeed(int signal);
@@ -14,13 +13,14 @@ extern int GetCsAtcSpeed(int signal);
 // --- 地上子タイプ定義 ---
 const int BEACON_TYPE_LINE_CHECK = 20; // 号線照合用地上子のType番号
 const int BEACON_TYPE_ADVANCE_NOTICE = 31;  // 前方予告用地上子 (21 -> 31へ修正)
-const float TASC_DECEL_MS2 = 0.6944f;        // 目標減速度 (既定2.5 km/h/s)
+float TASC_DECEL_MS2 = 0.6944f;        // 目標減速度 (既定2.5 km/h/s)
 
 // --- グローバル変数 ---
  // 現在の閉塞から取得したATC制限速度 (km/h)
 int g_currentAtcSpeed = 0;   // 現在の閉塞から取得したATC制限速度 (km/h)
 
 int g_lastRawSignal = 0;     // BVEから最後に送られてきた生の信号インデックスを記憶する
+int g_receivedSignal = 0;        // BVEから最後に送られてきた信号インデックスを記憶する
 
 int g_lastCsLimitSpeed = -1;  // 前回のCS-ATC制限速度を記憶する変数（初期値は-1）
 
@@ -42,8 +42,8 @@ int g_driverBrake = 0; // 運転士が現在セットしているブレーキ段
 int g_driverReverser = 0; // 運転士が現在セットしているレバーの前後進位置（-1=後進, 0=ニュートラル, 1=前進）
 int g_driverConstantSpeed = 0; // 運転士が現在セットしている定速段数
 int g_MaxBrakeCNotch = 0; // 常用最大ブレーキ段数（iniから読み込み、0〜6の範囲で設定可能、初期値は6）
-int g_maxPowerNotch = 0;
-int g_atsReverserNotch = 0;
+int g_maxPowerNotch = 0; // 車両の最大力行段数（iniから読み込み、0〜6の範囲で設定可能、初期値は6）
+int g_atsReverserNotch = 0; // ATSが現在セットしているレバーの前後進位置（-1=後進, 0=ニュートラル, 1=前進）
 int g_atsBrakeNotch = 0;
 int g_brake67Notch = 0;
 int g_cars = 0;
@@ -69,6 +69,8 @@ bool g_isAtcFailed = false;      // 現在ATCが故障中かどうか
 // 外部INIファイルから読み込む車両の仕様設定
 int g_maxBrakeNotch = 6; // ブレーキ最大段数（iniから読み込み、0〜6の範囲で設定可能、初期値は6）
 int g_atcTypeSetting = 2; // 0=WS固定, 1=CS固定, 2=両方
+bool g_tascEnabled = true; // この車両でTASCモードを使えるか INIファイル対応 ([VehicleSpec] TascEnable)
+bool g_atoEnabled = true;  // この車両でATOモードを使えるか INIファイル対応 ([VehicleSpec] AtoEnable)
 
 
 // 現在選択されているアクティブなATCモード (false = WS-ATC, true = CS-ATC)
@@ -113,6 +115,7 @@ const int BEACON_ATOAUTOSTART = 1003; //自動発進
 const int BEACON_SPEEDLIMIT = 1007; //速度制限
 bool s_isTascActive = false; //TASC制御中かどうか
 int g_extendedNotches = 0; //拡張ノッチ段数　INIファイル対応
+float g_defaultClearance = 0.5f; //デフォルトの許容範囲　INIファイル対応
 int g_pressureRatesCount = 0; //圧力比率テーブルの要素数
 bool g_TASC_Failure = false; //TASC故障フラグ　trueで故障
 float g_TASC_FailureRate = 0.0f; //TASC故障率　0.0～1.0の範囲で設定可能
@@ -128,7 +131,7 @@ HINSTANCE g_hModule = NULL;
     // ※ 乗り入れ境界での手動切り替え時は、号線番号に応じて路線属性を確定させます
     // 必要に応じて号線番号の割り当て条件を調整可能です
 
-void UpdateLineFlagsFromCurrentLine() {
+static void UpdateLineFlagsFromCurrentLine() {
     g_isMidosuji = (g_currentLine == 1);
     g_isChuo = (g_currentLine == 4);
     g_isKitakyu = (g_currentLine == 9);
@@ -136,13 +139,13 @@ void UpdateLineFlagsFromCurrentLine() {
     g_isKeihan = false;
 }
 // CS-ATC保持状態のリセット関数
-void ResetCsAtcState() {
+static void ResetCsAtcState() {
     g_csLimitSpeed = 0;
     g_lastCsLimitSpeed = -1;
     g_isAdvanceNoticeActive = false;
 }
 // カンマ区切りの文字列から要素数をカウントする関数
-int CountCommaSeparatedElements(const char* str) {
+static int CountCommaSeparatedElements(const char* str) {
     if (str == NULL || str[0] == '\0') {
         return 0;
     }
@@ -155,25 +158,43 @@ int CountCommaSeparatedElements(const char* str) {
     }
     return count;
 }
-// DLLのエントリポイント　INIファイルから読み込む車両の仕様設定
+// DLLのエントリポイント
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
     if (fdwReason == DLL_PROCESS_ATTACH) {
-		srand((unsigned int)time(NULL)); // 乱数の初期化
-        char dllPath[MAX_PATH];
+		g_hModule = hinstDLL; // DLLのインスタンスハンドルを保持
+		DisableThreadLibraryCalls(hinstDLL); // スレッドの作成/終了通知を無効化
+    }
+    return TRUE;
+}
+
+// INIから true/false を読む(true, 1 で true)。行の後ろのコメント(; 以降)は取り除く
+static bool ReadIniBool(const char* section, const char* key, bool def, const char* iniPath) {
+    char buf[128] = { 0 };
+    GetPrivateProfileStringA(section, key, "", buf, sizeof(buf), iniPath);
+    char* sc = strchr(buf, ';');
+    if (sc != NULL) *sc = '\0';
+    int len = (int)strlen(buf);
+    while (len > 0 && (buf[len - 1] == ' ' || buf[len - 1] == '\t')) buf[--len] = '\0';
+    if (buf[0] == '\0') return def;
+    return (_stricmp(buf, "true") == 0 || atoi(buf) != 0);
+}
+
+static void LoadSettings()
+{
+    {
+		srand((unsigned int)time(NULL)); // 乱数の初期化)
         char iniPath[MAX_PATH];
-
-        GetModuleFileNameA(hinstDLL, dllPath, MAX_PATH);
-
-        char* lastSlash = strrchr(dllPath, '\\');
+        GetModuleFileNameA(g_hModule, iniPath, MAX_PATH);
+        char* lastSlash = strrchr(iniPath, '\\');
         if (lastSlash != NULL) {
             *lastSlash = '\0';
-            wsprintfA(iniPath, "%s\\ATS.ini", dllPath);
+            lstrcatA(iniPath, "\\ATS.ini");
         }
         else {
-			wsprintfA(iniPath, ".\\ATS.ini"); //リリース時はATS.iniがDLLと同じフォルダにあることを想定
+            lstrcpyA(iniPath, ".\\ATS.ini");
         }
-
+        
         // 一旦、一時的な変数にINIの値を読み出す
         int tempMaxBrake = GetPrivateProfileIntA("VehicleSpec", "MaxBrake", 6, iniPath);
 
@@ -181,25 +202,28 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
         if (tempMaxBrake <= 0) {
             g_maxBrakeNotch = 6;
         }
-		// 【安全対策】読み込んだ値が 6 より大きい場合は、最大段数を 6 に制限する
+        // 【安全対策】読み込んだ値が 6 より大きい場合は、最大段数を 6 に制限する
         else {
             g_maxBrakeNotch = tempMaxBrake;
         }
         // 【新規】車両のATC搭載仕様を読み込み（0=WS固定, 1=CS固定, 2=両方、デフォルトは両方）
         g_atcTypeSetting = GetPrivateProfileIntA("VehicleSpec", "AtcType", 2, iniPath);
         if (g_atcTypeSetting < 0 || g_atcTypeSetting > 2) g_atcTypeSetting = 2;
+        // 車両が対応するTASC/ATO(書かなければ両方とも使える)
+        g_tascEnabled = ReadIniBool("VehicleSpec", "TascEnable", true, iniPath);
+        g_atoEnabled = ReadIniBool("VehicleSpec", "AtoEnable", true, iniPath);
 
         // --- 【新規】号線仕様の読み込み ---
         g_minLine = GetPrivateProfileIntA("LineSpec", "MinLine", 1, iniPath);
-        g_maxLine = GetPrivateProfileIntA("LineSpec", "MaxLine", 8, iniPath);
+        g_maxLine = GetPrivateProfileIntA("LineSpec", "MaxLine", 9, iniPath);
         g_defaultLine = GetPrivateProfileIntA("LineSpec", "DefaultLine", 1, iniPath);
 
         // 範囲チェックとバリデーション
         if (g_minLine < 1) g_minLine = 1;
-        if (g_maxLine > 8) g_maxLine = 8;
+        if (g_maxLine > 9) g_maxLine = 9;
         if (g_minLine > g_maxLine) g_minLine = g_maxLine;
 
-		// デフォルト号線が範囲外の場合は、最小号線または最大号線に補正
+        // デフォルト号線が範囲外の場合は、最小号線または最大号線に補正
         if (g_defaultLine < g_minLine) g_defaultLine = g_minLine;
         if (g_defaultLine > g_maxLine) g_defaultLine = g_maxLine;
 
@@ -231,16 +255,16 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
         else {
             // 0.0000001% (0.000000001) 未満は計算発散回避のためアプリ終了
             if (g_failParameter < 0.000000001f) {
-                    // エラーメッセージをポップアップ表示
-                    MessageBoxA(
-                        NULL,
-                        "ATS.ini の [ATC] FailParameter 設定値が無効です。\n"
-                        "値が小さすぎるためプラグインを読み込めません。(許容値: 0.000000001 以上)\n\n"
-                        "設定値を確認してください。",
-                        "エラー",
-                        MB_OK | MB_ICONERROR | MB_TOPMOST
-                    );
-                    ExitProcess(1); // メッセージ確認後にアプリケーションを終了
+                // エラーメッセージをポップアップ表示
+                MessageBoxA(
+                    NULL,
+                    "ATS.ini の [ATC] FailParameter 設定値が無効です。\n"
+                    "値が小さすぎるためプラグインを読み込めません。(許容値: 0.000000001 以上)\n\n"
+                    "設定値を確認してください。",
+                    "エラー",
+                    MB_OK | MB_ICONERROR | MB_TOPMOST
+                );
+                ExitProcess(1); // メッセージ確認後にアプリケーションを終了
             }
             // 1.0を超えている場合は1.0未満に丸める
             if (g_failParameter > 1.0f) {
@@ -256,12 +280,12 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 
             }
         }
-        
-		g_extendedNotches = GetPrivateProfileIntA("TASC", "ExtendedNotches", 0, iniPath);
+
+        g_extendedNotches = GetPrivateProfileIntA("TASC", "ExtendedNotches", 0, iniPath);
         // 3. INIから PressureRates カンマ区切り文字列を取得
         char pressureRatesBuf[1024] = { 0 };
         GetPrivateProfileStringA("TASC", "PressureRates", "", pressureRatesBuf, sizeof(pressureRatesBuf), iniPath);        // 3. 境界外チェック (ExtendedNotches が PressureRates を上回っている場合)
-        
+
         // 4. カンマの数から PressureRates 配列の要素数を算出
         int pressureRatesCount = CountCommaSeparatedElements(pressureRatesBuf);
         if (g_extendedNotches > pressureRatesCount) {
@@ -282,95 +306,109 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 
             // アプリケーション（BVE本体）を即座に安全終了させる
             ExitProcess(1);
-            return FALSE;
         }
-		// --TASC故障関連パラメータの読み込み--
-		char failurebuf[32] = { 0 };
-		GetPrivateProfileStringA("TASC", "Failure", "false", failurebuf, sizeof(failurebuf), iniPath);
+        char tolBuf[32] = { 0 };
+        GetPrivateProfileStringA("TASC", "DefaultClearance", "0.5", tolBuf, sizeof(tolBuf), iniPath);
+        g_defaultClearance = (float)atof(tolBuf);
+        if (g_defaultClearance <= 0.0f) {
+            g_defaultClearance = 0.5f; // 負の値は無効として0.5に丸める
+        }
+        // --TASC故障関連パラメータの読み込み--
+        char failurebuf[32] = { 0 };
+        GetPrivateProfileStringA("TASC", "Failure", "false", failurebuf, sizeof(failurebuf), iniPath);
         if (_stricmp(failurebuf, "true") == 0) {
             g_TASC_FailureActive = true;
         }
-		else {
-			g_TASC_FailureActive = false;
-		}
-		GetPrivateProfileStringA("TASC", "FailureRate", "0.0", failurebuf, sizeof(failurebuf), iniPath);
-		g_TASC_FailureRate = (float)atof(failurebuf);
-		if (g_TASC_FailureRate < 0.0f) { // 0.0未満は無効として0.0に丸める
-			g_TASC_FailureActive = false; // 故障率が無効な場合は故障を無効化
-			g_TASC_FailureRate = 0.0f; // 故障率を0.0にset
+        else {
+            g_TASC_FailureActive = false;
+        }
+        GetPrivateProfileStringA("TASC", "FailureRate", "0.0", failurebuf, sizeof(failurebuf), iniPath);
+        g_TASC_FailureRate = (float)atof(failurebuf);
+        if (g_TASC_FailureRate <= 0.0f) { // 0.0未満は無効として0.0に丸める
+            g_TASC_FailureActive = false; // 故障率が無効な場合は故障を無効化
+            g_TASC_FailureRate = 0.0f; // 故障率を0.0にset
         }
         else {
-			if (g_TASC_FailureRate < 0.0000001f) { // 0.0000001% (0.000000001) 未満は計算発散回避のためアプリ終了
-				MessageBoxA(
-					NULL,
-					"ATS.ini の [TASC] FailureRate 設定値が無効です。\n"
-					"値が小さすぎるためプラグインを読み込めません。(許容値: 0.0000001 以上)\n\n"
-					"設定値を確認してください。",
-					"エラー",
-					MB_OK | MB_ICONERROR | MB_TOPMOST
-				);
-				ExitProcess(1);
-			}
-			if (g_TASC_FailureRate > 1.0f) { // 1.0を超えている場合は1.0未満に丸める
-				g_TASC_FailureRate = 1.0f;
-				MessageBoxA(
-					NULL,
-					"ATS.ini の [TASC] FailureRate 設定値が無効です。\n"
-					"値が大きすぎます。(許容値: 1.00 以下)\n\n"
-					"設定値を確認してください。OKをクリックすると100%に読み替えて続行します。",
-					"警告",
-					MB_OK | MB_ICONWARNING | MB_TOPMOST
-				);
-			}
-            
+            if (g_TASC_FailureRate < 0.0000001f) { // 0.0000001% (0.000000001) 未満は計算発散回避のためアプリ終了
+                MessageBoxA(
+                    NULL,
+                    "ATS.ini の [TASC] FailureRate 設定値が無効です。\n"
+                    "値が小さすぎるためプラグインを読み込めません。(許容値: 0.0000001 以上)\n\n"
+                    "設定値を確認してください。",
+                    "エラー",
+                    MB_OK | MB_ICONERROR | MB_TOPMOST
+                );
+                ExitProcess(1);
+            }
+            if (g_TASC_FailureRate > 1.0f) { // 1.0を超えている場合は1.0未満に丸める
+                g_TASC_FailureRate = 1.0f;
+                MessageBoxA(
+                    NULL,
+                    "ATS.ini の [TASC] FailureRate 設定値が無効です。\n"
+                    "値が大きすぎます。(許容値: 1.00 以下)\n\n"
+                    "設定値を確認してください。OKをクリックすると100%に読み替えて続行します。",
+                    "警告",
+                    MB_OK | MB_ICONWARNING | MB_TOPMOST
+                );
+            }
+
         }
-		// --ATO故障関連パラメータの読み込み-- 実装は10月下旬。ここではダミーとして読み込むだけにする。
-		char ATOfailurebuf[32] = { 0 };
-		GetPrivateProfileStringA("ATO", "Failure", "false", ATOfailurebuf, sizeof(ATOfailurebuf), iniPath);
-		if (_stricmp(ATOfailurebuf, "true") == 0) {
-			g_ATO_FailureActive = true;
-		}
-		else {
-			g_ATO_FailureActive = false;
-		}
-		GetPrivateProfileStringA("ATO", "FailureRate", "0.0", ATOfailurebuf, sizeof(ATOfailurebuf), iniPath);
-		g_ATO_FailureRate = (float)atof(ATOfailurebuf);
-		if (g_ATO_FailureRate < 0.0f) { // 0.0未満は無効として0.0に丸める
-			g_ATO_FailureActive = false; // 故障率が無効な場合は故障を無効化
-			g_ATO_FailureRate = 0.0f; // 故障率を0.0にset
-		}
-		else {
-			if (g_ATO_FailureRate == 0.0000001f) { // 0.0000001% (0.000000001) 未満は計算発散回避のためアプリ終了
-				MessageBoxA(
-					NULL,
-					"ATS.ini の [ATO] FailureRate 設定値が無効です。\n"
-					"値が小さすぎるためプラグインを読み込めません。(許容値: 0.0000001 以上)\n\n"
-					"設定値を確認してください。"
+        // --ATO故障関連パラメータの読み込み-- 
+        char ATOfailurebuf[32] = { 0 };
+        GetPrivateProfileStringA("ATO", "Failure", "false", ATOfailurebuf, sizeof(ATOfailurebuf), iniPath);
+        if (_stricmp(ATOfailurebuf, "true") == 0) {
+            g_ATO_FailureActive = true;
+        }
+        else {
+            g_ATO_FailureActive = false;
+        }
+        GetPrivateProfileStringA("ATO", "FailureRate", "0.0", ATOfailurebuf, sizeof(ATOfailurebuf), iniPath);
+        g_ATO_FailureRate = (float)atof(ATOfailurebuf);
+        if (g_ATO_FailureRate <= 0.0f) { // 0.0未満は無効として0.0に丸める
+            g_ATO_FailureActive = false; // 故障率が無効な場合は故障を無効化
+            g_ATO_FailureRate = 0.0f; // 故障率を0.0にset
+        }
+        else {
+            if (g_ATO_FailureRate < 0.0000001f) { // 0.0000001% (0.000000001) 未満は計算発散回避のためアプリ終了
+                MessageBoxA(
+                    NULL,
+                    "ATS.ini の [ATO] FailureRate 設定値が無効です。\n"
+                    "値が小さすぎるためプラグインを読み込めません。(許容値: 0.0000001 以上)\n\n"
+                    "設定値を確認してください。",
+                    "エラー",
+                    MB_OK | MB_ICONERROR | MB_TOPMOST
+                );
+                ExitProcess(1);
+            }
+            if (g_ATO_FailureRate > 1.0f) { // 1.0を超えている場合は1.OTHに丸める
+                g_ATO_FailureRate = 1.0f;
+                MessageBoxA(
+                    NULL,
+                    "ATS.ini の [ATO] FailureRate 設定値が無効です。\n"
+                    "値が大きすぎます。(許容値: 1.0 以下)\n\n"
+                    "設定値を確認してください。OKをクリックすると100%に読み替えて続行します。"
                     "ダミー",
-					"エラー",
-					MB_OK | MB_ICONERROR | MB_TOPMOST
-				);
-				ExitProcess(1);
-			}
-			if (g_ATO_FailureRate > 1.0f) { // 1.0を超えている場合は1.OTHに丸める
-				g_ATO_FailureRate = 1.0f;
-				MessageBoxA(
-					NULL,
-					"ATS.ini の [ATO] FailureRate 設定値が無効です。\n"
-					"値が大きすぎます。(許容値: 1.0 以下)\n\n"
-					"設定値を確認してください。OKをクリックすると100%に読み替えて続行します。"
-                    "ダミー",
-					"警告",
-					MB_OK | MB_ICONWARNING | MB_TOPMOST
-				);
-			}
+                    "警告",
+                    MB_OK | MB_ICONWARNING | MB_TOPMOST
+                );
+            }
 
-		}
-        //TASC_DECEL_MS2 = GetPrivateProfileStringA("TASC", "deceleration","2.5",iniPath);
-
+        }
+		ATOLoadSettings(iniPath); //ATO設定の読み込み
+		TascLoadSettings(iniPath); //TASC設定の読み込み
+        // TASCの目標減速度 (INIでは km/h/s、内部では m/s^2 に換算して使う)
+        char decBuf[32] = { 0 };
+        GetPrivateProfileStringA("TASC", "Deceleration", "2.5", decBuf, sizeof(decBuf), iniPath);
+        float decKmhps = (float)atof(decBuf);
+        if (decKmhps < 0.5f || decKmhps > 5.0f) decKmhps = 2.5f;   // 範囲外は既定値
+        TASC_DECEL_MS2 = decKmhps / 3.6f;
     }
-    return TRUE;
+
 }
+
+    
+
+
 // プラグインのバージョンを返す関数 return 値は ATS_VERSION を返す それ以外は無効 ビルドエラーになる可能性があるので、必ず ATS_VERSION を返すこと
 ATS_API int WINAPI GetPluginVersion()
 {
@@ -380,6 +418,10 @@ ATS_API int WINAPI GetPluginVersion()
 // プラグインがロードされるとき
 ATS_API void WINAPI Load()
 {
+	LoadSettings(); // 設定の読み込み
+	InitATO(); // ATO初期化
+	ResetGrade(); // こう配補正の初期化
+    
     g_currentAtcSpeed = 0; // 現在の閉塞から取得したATC制限速度 (km/h) 初期化
     g_lastRawSignal = 0; // 信号インデックス 初期化
     g_wsLimitSpeed = 0; // WS-ATC制限速度 初期化
@@ -396,8 +438,8 @@ ATS_API void WINAPI Load()
 	g_isYardMode = false; // 構内モード 初期化
     g_isEmergencyOperationMode = false;  //非常運転モード
 	g_TASCATOSet = false; //TASC/ATOの有効化 0で手動 INIファイル対応　ATC電源がオフの時は非表示。不具合回避のため、オンにするときは手動をセットする。
-    g_ATOPower = 0;
-    g_Position = 0;
+	g_ATOPower = 0; //ATO力行指令　0で運転士のノッチと同じ　INIファイル対応　ATC電源がオフの時は非表示
+	g_Position = 0; //debug--停車位置までの距離 cm単位で1桁ずつ分ける 999.99mまで。これ以上は不要　ATC電源がオフの時は非表示
     g_PositionEnable = false; //停車位置の認識 手動でもtrueにする。ATC電源がオフの時は非表示
     g_TASCBrakeNotch = 0; //TASC制御・ATO制動指令で使用するブレーキノッチ　0で運転士のノッチと同じ INIファイル対応　ATC電源がオフの時は非表示
     g_TASCControl = false; //TASC制御中かどうか　電源オフの時は非表示
@@ -414,6 +456,10 @@ ATS_API void WINAPI Load()
     g_cars = 0;
 	g_pressureRatesCount = 0;
 	g_TASC_Failure = false; //TASC故障フラグ　trueで故障
+    g_ATO_Failure = false;
+    g_isAtcServiceBrake = false;
+    g_isAtcEmergencyBrake = false;
+    g_speed = 0.0f;
 
     // 現在選択されているアクティブなATCモード (false = WS-ATC, true = CS-ATC) 初期化
     if (g_atcTypeSetting == 1) {
@@ -424,7 +470,7 @@ ATS_API void WINAPI Load()
     }
     g_lastLocation = -1.0f; // 初期位置判定用にリセット
     // 号線を初期値にリセット
-    g_currentLine = 4; // 中央線初期化
+    g_currentLine = g_defaultLine; // 中央線初期化
     g_isLineMismatch = false; // 初期化
 
     // 前方予告作動中フラグを初期化
@@ -432,7 +478,6 @@ ATS_API void WINAPI Load()
     // 号線変更に伴う内部フラグの更新
     UpdateLineFlagsFromCurrentLine();
     g_isInNagataStation = false;
-    g_isChuo = true;
     g_isKeihan = false;
     g_isAtcServiceBrake = false;   // ATC常用パターン接近・介入
     g_isAtcEmergencyBrake = false; // ATC非常ブレーキ作動（02信号）
@@ -446,6 +491,7 @@ ATS_API void WINAPI Dispose()
 // 車両の仕様が設定されるときに呼ばれる関数 通常では使用しない
 ATS_API void WINAPI SetVehicleSpec(ATS_VEHICLESPEC vehicleSpec)
 {
+	g_maxPowerNotch = vehicleSpec.PowerNotches;   // 運転士の最大力行
 }
 // 運転士がパワーノッチを動かしたとき
 ATS_API void WINAPI SetPower(int pos)
@@ -467,12 +513,7 @@ ATS_API void WINAPI SetReverser(int pos)
 // BVEから現在の閉塞信号の状態が送られてくる関数
 ATS_API void WINAPI SetSignal(int signal)
 {
-    // 信号インデックスが変更された場合、前方予告を自動解除
-    if (signal != g_lastRawSignal) {
-        g_isAdvanceNoticeActive = false;
-    }
-	// 受信した信号インデックスを記憶する
-    g_lastRawSignal = signal;
+	g_receivedSignal = signal; // 受信した信号インデックスを記録
 
     // --- 【修正】近鉄けいはんな線(6〜9)とメトロWS(0〜5)のフィルタリング処理 ---
     if (g_isKeihan) {
@@ -493,6 +534,10 @@ ATS_API void WINAPI SetSignal(int signal)
             return;
         }
     }
+    if (signal != g_lastRawSignal) {
+		g_isAdvanceNoticeActive = false; // 信号が変化したら前方予告フラグをリセット
+    }
+	g_lastRawSignal = signal; // 受信した信号インデックスを記録
 
     if (signal >= 10) {
         // --- CS-ATC 故障抽選ロジック ---
@@ -572,31 +617,22 @@ ATS_API void WINAPI SetBeaconData(ATS_BEACONDATA beaconData)
             }
         }
 
-        // D. 複数号線データの判定 (バグ回避用に改修)
+        // D. 複数号線データの判定 
         else if (beaconValue > 8) {
-            // 方式1: ビットマスク判定 (例: 1 << 10 など)
-            if (g_currentLine <= 30 && (beaconValue & (1 << g_currentLine)) != 0) {
-                isMatched = true;
-            }
-            else {
-                // 方式2: 数値桁解析（「104」のような10進数結合データに対応）
-                // 2桁番号（10など）と1桁番号が混在しても確実に判定する
-                int temp = beaconValue;
-                while (temp > 0) {
-                    // 下2桁が一致するか（例: 1045 のうち 10）
-                    if (temp % 100 == g_currentLine) {
-                        isMatched = true;
-                        break;
-                    }
-                    // 下1桁が一致するか（例: 45 のうち 5）
-                    if (temp % 10 == g_currentLine) {
-                        isMatched = true;
-                        break;
-                    }
-                    temp /= 10;
+			// 数値桁解析を行い、各桁の値と現在号線を照合する
+			int temp = beaconValue;
+			while (temp > 0) {
+
+				if (temp % 100 == g_currentLine) {
+					isMatched = true;
+					break; // 照合成功したらループを抜ける
+				}
+                if (temp % 10 == g_currentLine) {
+                    isMatched = true;
+                    break;
                 }
-            }
-    
+				temp /= 10; // 次の桁に移動
+			}
         }
 
         // 照合結果の判定
@@ -617,6 +653,7 @@ ATS_API void WINAPI SetBeaconData(ATS_BEACONDATA beaconData)
 	// BEACON_TYPE_ADVANCE_NOTICE 信号現示が下がる前の前方予告地上子を受信した場合、フラグを立てる
 	if (beaconData.Type == BEACON_TYPE_ADVANCE_NOTICE) {
 		if (g_isAtcPowerOn && g_isCurrentModeCS) {
+			ATOOnAdvanceNotice(GetCsAtcSpeed(beaconData.Signal), beaconData.Distance, g_lastLocation);
 			if (beaconData.Signal < g_lastRawSignal) {
 				g_isAdvanceNoticeActive = true; // 前方予告作動中フラグを立てる
 			}
@@ -625,6 +662,20 @@ ATS_API void WINAPI SetBeaconData(ATS_BEACONDATA beaconData)
 			}
 		}
 	}
+	// ATO自動運転開始地上子を受信した場合、ATO自動運転を開始する
+	if (beaconData.Type == BEACON_ATOAUTOSTART) {
+		ATOOnAutoStartBeacon();
+	}
+
+	// 速度制限地上子を受信した場合、ATOの速度制限を更新する
+    if (beaconData.Type == BEACON_SPEEDLIMIT) {
+        // 速度制限地上子を受信した場合、ATOの速度制限を更新する
+        ATOOnSpeedLimitBeacon(beaconData.Optional, g_lastLocation);
+    }
+    // こう配地上子(1008)を受信した場合、TASC/ATOのこう配補正を更新する
+    if (beaconData.Type == BEACON_LEVEL) {
+        ProcessGradeBeacon(beaconData.Optional, g_lastLocation);
+    }
 }
 // 運転士がキーを押したときの処理
 ATS_API void WINAPI KeyDown(int key)
@@ -680,7 +731,7 @@ ATS_API void WINAPI KeyDown(int key)
             if (!g_isCurrentModeCS) {
                 ResetCsAtcState();
             }
-            SetSignal(g_lastRawSignal);
+            SetSignal(g_receivedSignal);
         }
     }
 
@@ -701,7 +752,7 @@ ATS_API void WINAPI KeyDown(int key)
             g_isLineMismatch = false;
 
             UpdateLineFlagsFromCurrentLine();
-            SetSignal(g_lastRawSignal);
+            SetSignal(g_receivedSignal);
         }
     }
     // ATS_KEY_D (2 キー): 号線戻し (-1)　近鉄モード時は切り替えないように
@@ -714,7 +765,7 @@ ATS_API void WINAPI KeyDown(int key)
             g_isLineMismatch = false;
 
             UpdateLineFlagsFromCurrentLine();
-            SetSignal(g_lastRawSignal);
+            SetSignal(g_receivedSignal);
         }
     }
         // --- 長田駅での近鉄直通モード切替（4キー: ATS_KEY_F） ---
@@ -726,13 +777,14 @@ ATS_API void WINAPI KeyDown(int key)
                 g_isChuo = false;
                 ResetCsAtcState(); // 近鉄線（WS）切替に伴うリセット
             }
-            else {
+            else if (g_isKeihan)
+               {
                 // 近鉄けいはんな線モード -> 中央線モード復帰
                 g_isKeihan = false;
                 g_isChuo = true;
                 g_isCurrentModeCS = (g_atcTypeSetting == 1 || g_atcTypeSetting == 2);
             }
-            SetSignal(g_lastRawSignal);
+            SetSignal(g_receivedSignal);
         }
     }
     // =========================================================
@@ -741,17 +793,22 @@ ATS_API void WINAPI KeyDown(int key)
     if (key == ATS_KEY_G) {
         // ATC電源がONかつ安全条件を満たしている場合のみ切替を許可
         if (g_isAtcPowerOn && isSafetyConditionMet) {
-            g_TASCATOSet++;
-
             // 0: 手動 -> 1: TASC -> 2: ATO -> 0: 手動... と循環
-            if (g_TASCATOSet > 2) {
-                g_TASCATOSet = 0;
-            }
+            // INIで使えないようにしたモードは飛ばす(手動は必ず使える)
+            do {
+                g_TASCATOSet++;
+                if (g_TASCATOSet > 2) {
+                    g_TASCATOSet = 0;
+                }
+            } while ((g_TASCATOSet == 1 && !g_tascEnabled) || (g_TASCATOSet == 2 && !g_atoEnabled));
             
             // モード切替時にTASCの内部状態をリセット
             InitTasc();
+            TascArmHold();   // 止まっていれば転動防止ブレーキを掛ける(TASC/ATOモードのとき)
         }
     }
+    if (key == ATS_KEY_H) { ATOOnStartKey();}
+	if (key == ATS_KEY_I) {	g_inching = true;} //インチングキー}
 
 }
 
@@ -794,6 +851,13 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
     }
     else {
         // --- 2. 通常のWS-ATC自動ブレーキ制御の判定ロジック ---
+        g_isAtcEmergencyBrake = false;   // ★追加: 毎フレーム最初にクリア
+        g_isAtcServiceBrake = false;     // ★追加
+        if (g_isLineMismatch) {
+			InitTasc(); // TASC/ATOの内部状態をリセット
+        }
+        int tascBrake = CalculateTascBrake(vehicleState.Location, vehicleState.Speed, g_driverBrake, currentTimeMs); // ★追加: TASC計算はここで1回だけ
+
         int effectiveLimitSpeed = g_currentAtcSpeed;
 
         if (g_isYardMode) {
@@ -815,7 +879,6 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
             g_isAtcEmergencyBrake = false;
             g_isAtcServiceBrake = false;
         }
-        // 2. TASCブレーキ計算の呼び出し
         // 2. ATC故障時判定（非常運転モードOFFの場合）
         else if (g_isAtcFailed) {
             outputBrake = g_maxBrakeNotch + 1;
@@ -850,27 +913,11 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
             g_isAtcEmergencyBrake = false;
             g_isAtcServiceBrake = true;
         }
-        // =========================================================
-        // TASC自動ブレーキ制御判定 (ATC非常ブレーキ時のみ)
-        // =========================================================
 
-        else if (!g_isAtcEmergencyBrake) {
-            int tascBrake = CalculateTascBrake(vehicleState.Location, vehicleState.Speed, outputBrake, currentTimeMs);
-
-            // ATC常用ブレーキまたはTASCブレーキの厳しい方を採用
-            if (tascBrake > outputBrake) {
-                outputBrake = tascBrake;
-            }
+        if (!g_isAtcEmergencyBrake && !g_isAtcServiceBrake && tascBrake > outputBrake) {
+            outputBrake = tascBrake;   // ATCが介入していないときだけ、TASCのブレーキを採用
         }
-        // 運転士ノッチによる通常の出力（制限速度内での運転）を許可
-        else {
-            outputBrake = g_driverBrake;
-            outputPower = g_driverPower;
-            if (g_isCurrentModeCS) {
-                g_isAtcEmergencyBrake = false;
-                g_isAtcServiceBrake = false;
-            }
-        }
+        
 
         // 超過ブザー (WS-ATCモード時かつ構内モードOFF時のみ動作)
         // ビー音
@@ -887,7 +934,7 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
             }
         }
 
-        bool isAtcSignalReceived = ((g_lastRawSignal >= 10 && g_lastRawSignal <= 30) || g_lastRawSignal == 43);
+		bool isAtcSignalReceived = ((g_lastRawSignal >= 10 && g_lastRawSignal <= 30) || g_lastRawSignal == 43); // 非設モード警報音の条件判定
 
         if (g_isOverrideMode && isAtcSignalReceived && !g_isAtcFailed) {
             if (!g_isOverrideWarningPlaying) {
@@ -903,43 +950,43 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
 
         }
     }
-    // --- 非設モード警報音 (sound[2]) 制御 ---
-        // 条件: 非設モード有効 かつ ATC信号インデックスを受信中(10〜30 または 43)
-		// case 43 構内モード専用のため、非設モード警報音の条件に含める必要がある
-        bool isAtcSignalReceived = ((g_lastRawSignal >= 10 && g_lastRawSignal <= 30) || g_lastRawSignal == 43);
 
-        if (g_isOverrideMode && isAtcSignalReceived) {
-            if (!g_isOverrideWarningPlaying) {
-                sound[2] = ATS_SOUND_PLAYLOOPING;
-                g_isOverrideWarningPlaying = true;
-            }
+	// --- 5. ATO運転処理 ---
+	bool atcFree = g_isAtcPowerOn && !g_isAtcEmergencyBrake && !g_isAtcServiceBrake && !g_isOverrideMode && !g_isEmergencyOperationMode;
+	ATOUpdate(atcFree, vehicleState.Speed, g_currentAtcSpeed, (float)vehicleState.Location, vehicleState.Time); // ATO更新処理
+    outputPower = ATOConvertDriverPower(outputPower);   // 力行の拡張ノッチを使うとき、運転士のノッチをATOのノッチに変換する
+    if (g_ATOStart == 1) {
+        outputPower = ATOGetPower();        // ATO運転中は力行ノッチをATOが決める(0なら惰行。拡張ノッチ対応)
+        int atoBrake = ATOGetBrake();
+        if (atoBrake > outputBrake) {       // 運転士・ATC・TASCのブレーキより強いときだけ採用
+            outputBrake = atoBrake;
+            outputPower = 0;
         }
-        else {
-            if (g_isOverrideWarningPlaying) {
-                sound[2] = ATS_SOUND_STOP;
-                g_isOverrideWarningPlaying = false;
-            }
-        }
-    
-    
+    }
+    // --- 5b. インチング(目標位置の手前・奥で止まったとき、キーを押している間だけ動く) ---
+    int outputReverser = g_driverReverser;
+    if (TascInchingUpdate(g_inching, atcFree, (float)vehicleState.Location, vehicleState.Speed,
+        g_driverBrake, g_driverPower, g_driverReverser)) {
+        outputPower = ATOConvertDriverPower(TascInchingPower());   // インチングのノッチも変換する
+        int inchBrake = TascInchingBrake();
+        outputBrake = (g_driverBrake > inchBrake) ? g_driverBrake : inchBrake;   // 運転士のブレーキが強ければそちらを優先
+        outputReverser = TascInchingReverser();
+    }
 
-	// --- 4. ハンドル出力の設定 ---
+	// --- 6. ハンドル出力の設定 ---
     handles.Power = outputPower;
     handles.Brake = outputBrake;
-    handles.Reverser = g_driverReverser;
+    handles.Reverser = outputReverser;
     handles.ConstantSpeed = 0;
 
-
-    // 1. TASCブレーキ計算処理呼び出し
-    int tascBrakeOutput = CalculateTascBrake(vehicleState.Location, vehicleState.Speed, g_driverBrake, vehicleState.Time);
     // ----------------------------------------------------
-    // 2. パネル出力処理 (INI使わず定数値で直接指定)
+    // 7. パネル出力処理 (INI使わず定数値で直接指定)
     // ----------------------------------------------------
 
-    // TASCブレーキ指令段数 (DigitalNumber: 0〜14)
-    if (PANEL_TASC_NOTCH >= 0 && PANEL_TASC_NOTCH < 256) {
-        panel[PANEL_TASC_NOTCH] = GetCurrentTascBrakeNotch();
-    }
+    // TASCブレーキ指令 (DigitalNumber): 0=非表示(手動・ATC電源OFF), 1=N, 2以降=B1, B2, …
+    //   TASCモードでは、TASCが制御していないときも「N」を表示する(ATOモードではATO指令(139)に表示するので非表示)
+    bool showTascPanel = g_isAtcPowerOn && g_TASCATOSet == 1;
+    panel[PANEL_TASC_NOTCH] = showTascPanel ? GetCurrentTascBrakeNotch() + 1 : 0;
 
     // 定点停止灯 (PilotLamp): 故障中は 0 (消灯)
     if (PANEL_POSITION_ENABLE >= 0 && PANEL_POSITION_ENABLE < 256) {
@@ -959,7 +1006,6 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
 	panel[133] = g_TASCATOSet + 1; // TASC/ATOモード切替状態 (0:手動, 1:TASC, 2:ATO)
 	panel[134] = (g_TASCATOSet == 1 && IsTascActive()) ? 1 : 0; // TASCモード表示灯 (1:点灯) 
 
-    // --- panel.txt への出力 ---
     //panel[11] = g_isAtcServiceBrake ? 1 : 0;   // ATC常用 (0:非表示, 1:点灯)
     //panel[12] = g_isAtcEmergencyBrake ? 1 : 0; // ATC非常 (0:非表示, 1:点灯)
     // CS-ATC車内信号灯パネル（10〜30）および開通表示灯（31, 32）を初期化 (0:消灯)
@@ -975,7 +1021,8 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
         panel[12] = 0;
         panel[50] = 0;   // ATC常用 (0:非表示, 1:点灯)
         panel[51] = 0; // ATC非常 (0:非表示, 1:点灯)
-		panel[133] = 0; // TASC/ATOモード切替状態 (0:手動, 1:TASC, 2:ATO)
+		if (!g_isAtcPowerOn) panel[133] = 0; // TASC/ATOモード切替状態 (0:手動, 1:TASC, 2:ATO)
+		
 		panel[134] = 0; // TASCモード表示灯 (1:点灯)
     }
     else {
@@ -1004,48 +1051,49 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
             panel[0] = g_csLimitSpeed; // デジタル車内信号速度 (数値)
             panel[50] = g_isAtcServiceBrake ? 1 : 0;   // ATC常用 (0:非表示, 1:点灯)
             panel[51] = g_isAtcEmergencyBrake ? 1 : 0; // ATC非常 (0:非表示, 1:点灯)
-            // 号線不一致の場合：非常/絶対停止 (panel[10]) を消灯し、開通表示灯は消灯
-     if (g_isAdvanceNoticeActive) {
-        panel[33] = 1; // 前方予告作動中フラグを点灯
-    }
-
-        if (g_isLineMismatch) {
-            panel[0] = 0;
-            panel[51] = 1; // ATC非常 (0:非表示, 1:点灯)
-            panel[g_lastRawSignal] = 0; // 車内信号灯は消灯
-            // panel[31], panel[32] は 0 (消灯)
-        }
-        // 受信しているCS-ATC信号インデックス (10〜30) に応じた処理
-        else if (g_lastRawSignal >= 10 && g_lastRawSignal <= 30) {
-            // 1. 各信号インデックスに対応する車内信号灯を点灯
-            panel[g_lastRawSignal] = 1;
-
-            // 2. 開通状態表示灯の出力設定
-            if (g_lastRawSignal >= 13) {
-                // case 13 以上：進行（開通）信号
-                panel[31] = 1; // 進行表示灯
-                panel[32] = 0;
+            if (g_isAdvanceNoticeActive) {
+                panel[33] = 1; // 前方予告作動中フラグを点灯
             }
-            else if (g_lastRawSignal == 11 || g_lastRawSignal == 12) {
-                // case 11 / 12：停止（01信号）
-                panel[31] = 0;
-                panel[32] = 1; // 停止(01)表示灯
-                panel[50] = 1;   // ATC常用 (0:非表示, 1:点灯)
-                panel[51] = 0; // ATC非常 (0:非表示, 1:点灯)
-
-            }
-            else if (g_lastRawSignal == 10) {
-                // case 10：絶対停止・無信号（進入時）
-                panel[31] = 0; // 消灯
-                panel[32] = 0; // 消灯
-				panel[g_lastRawSignal] = 0; // 10番のインデックスは絶対停止なので、車内信号灯は消灯
-                panel[0] = 0;
+			else {
 				panel[33] = 0; // 前方予告作動中フラグを消灯
-                panel[50] = 0;   // ATC常用 (0:非表示, 1:点灯)
-                panel[51] = g_isAtcEmergencyBrake ? 1 : 0;
+			}
+
+            if (g_isLineMismatch) {
+                panel[0] = 0;
+                panel[51] = 1; // ATC非常 (0:非表示, 1:点灯)
+                // panel[31], panel[32] は 0 (消灯)
+            }
+            // 受信しているCS-ATC信号インデックス (10〜30) に応じた処理
+            else if (g_lastRawSignal >= 10 && g_lastRawSignal <= 30) {
+                // 1. 各信号インデックスに対応する車内信号灯を点灯
+                panel[g_lastRawSignal] = 1;
+
+                // 2. 開通状態表示灯の出力設定
+                if (g_lastRawSignal >= 13) {
+                    // case 13 以上：進行（開通）信号
+                    panel[31] = 1; // 進行表示灯
+                    panel[32] = 0;
+                }
+                else if (g_lastRawSignal == 11 || g_lastRawSignal == 12) {
+                    // case 11 / 12：停止（01信号）
+                    panel[31] = 0;
+                    panel[32] = 1; // 停止(01)表示灯
+                    panel[50] = 1;   // ATC常用 (0:非表示, 1:点灯)
+                    panel[51] = 0; // ATC非常 (0:非表示, 1:点灯)
+
+                }
+                else if (g_lastRawSignal == 10) {
+                    // case 10：絶対停止・無信号（進入時）
+                    panel[31] = 0; // 消灯
+                    panel[32] = 0; // 消灯
+				    panel[g_lastRawSignal] = 0; // 10番のインデックスは絶対停止なので、車内信号灯は消灯
+                    panel[0] = 0;
+				    panel[33] = 0; // 前方予告作動中フラグを消灯
+                    panel[50] = 0;   // ATC常用 (0:非表示, 1:点灯)
+                    panel[51] = g_isAtcEmergencyBrake ? 1 : 0;
+                }
             }
         }
-    }
     }
     else {
         // WS-ATCモード時または電源OFF時は車内信号指示・表示灯をすべて消灯 (0)
@@ -1057,6 +1105,23 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
 
         }
     }
+    panel[PANEL_ATO_STATE] = (g_ATOStart < 0) ? 0 : ((g_ATOStart == 0) ? 1 : 2);
+    // ATO力行・ブレーキ指令 (DigitalNumber): 0=非表示(ATOモード以外・ATC電源OFF), 1=N, 2以降=P1/B1, P2/B2, …
+    //   発進待ちや惰行中も「N」を表示する。駅に止まるときのTASCのブレーキも、ATOのブレーキ指令として表示する
+    bool showAtoPanel = g_isAtcPowerOn && g_TASCATOSet == 2;
+    int atoBrakeStep = ATOGetBrakeStep();
+    int tascBrakeStep = GetCurrentTascBrakeNotch();
+    if (tascBrakeStep > atoBrakeStep) atoBrakeStep = tascBrakeStep;
+    //   力行とブレーキの画像を同じ場所に置けるよう、どちらか一方だけを表示する
+    //   力行中 → 力行指令(138)だけ / それ以外(ブレーキ中・N) → ブレーキ指令(139)だけ(Nもこちらに表示)
+    int atoPowerStep = (g_ATOStart == 1) ? g_ATOPower : 0;
+    bool atoPowering = (atoPowerStep > 0 && atoBrakeStep == 0);
+    panel[PANEL_ATO_POWER] = (showAtoPanel && atoPowering) ? atoPowerStep + 1 : 0;
+    panel[PANEL_ATO_BRAKE] = (showAtoPanel && !atoPowering) ? atoBrakeStep + 1 : 0;
+    panel[PANEL_ATO_FAILURE] = (g_ATO_Failure && g_isAtcPowerOn && g_TASCATOSet == 2) ? 1 : 0;
+    panel[PANEL_ATO_AUTOSTART] = ATOIsAutoStartReady() ? 1 : 0;
+    panel[PANEL_INCHING] = TascIsInching() ? 1 : 0;   // インチング中表示灯
+
     if (g_shouldPlayBell) {
         sound[1] = ATS_SOUND_PLAY; // 1番のインデックスに単発再生命令（1）を送る
         g_shouldPlayBell = false;  // 鳴らしたら即座にフラグを戻す（1フレームだけ鳴らすため）
@@ -1066,16 +1131,26 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
 }
 
 // その他の必須イベント関数（空実装）この関数がないとビルドエラーになるので、空実装で定義しておく
-ATS_API void WINAPI KeyUp(int key) {}
+ATS_API void WINAPI KeyUp(int key) {
+    if (key == ATS_KEY_I) {
+        g_inching = false;
+    }
+}
 ATS_API void WINAPI DoorOpen()
 {
     OnDoorOpen();
+	ATOOnDoorOpen();
 }
-ATS_API void WINAPI DoorClose() {}
+ATS_API void WINAPI DoorClose() {
+	TascOnDoorClose(); // 転動防止ブレーキ(INIの設定でドアが閉まったら緩める)
+	ATOOnDoorClose();
+}
 
 // 駅ジャンプしたときやシナリオをやり直すときに呼ばれる関数（初期化処理）
 ATS_API void WINAPI Initialize(int key)
 {
+	g_inching = false; //インチングキーをリセット
+	ResetGrade(); // 勾配情報をリセット
     g_speed = 0.0f; //速度が0になるため、誤作動対策でこのコードを記述する
 	if (g_isAtcPowerOn) {
 		g_isAtcPowerOn = false; // ATC電源をOFFにする
@@ -1083,6 +1158,8 @@ ATS_API void WINAPI Initialize(int key)
 		g_lastRawSignal = -1; // 信号インデックスを初期化（未受信状態）
 	}
 	InitTasc(); // TASCの内部状態をリセット
+	TascArmHold(); // 止まっていれば、TASC/ATOモードにしたとき転動防止ブレーキを掛ける
+	ATOOnInitialize(); // 駅ジャンプ後も、ドアが閉まったら自動発進できるようにする
 	if (g_isInNagataStation) {
 		g_isInNagataStation = false; // 長田駅エリアフラグをリセット
 	}
