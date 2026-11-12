@@ -17,6 +17,7 @@ static float ATO_COAST_LOOKAHEAD_SEC = 5.0f;     // 惰行したときの速度�
 static int   ATO_UPHILL_NOTCH_BONUS_MAX = 2;     // のぼりで力行ノッチを上げる最大段数(10‰ごとに1段)
 static int   ATO_EXT_POWER_NOTCHES = 0;          // 力行の拡張ノッチ数(0で使わない。31ならP1〜P31)
 static bool  ATO_AUTOSTART_AFTER_JUMP = true;    // true: 駅ジャンプ・シナリオ開始のあと、ドアが閉まったら自動発進する
+static bool  ATO_NOTCH_RETURN = true;            // false: 戻しノッチに対応していない車両(力行中はノッチを下げず、下げるときはNまで戻す)
 static const int MAX_DRIVER_MAP = 32;
 static int   s_driverMap[MAX_DRIVER_MAP];        // 運転士のP1, P2, … を変換したATOのノッチ(INIの DriverPowerMap)
 static int   s_driverMapCount = 0;               // DriverPowerMap に書かれた数
@@ -58,6 +59,7 @@ static bool IniBool(const char* key, bool def, const char* iniPath) {
 // ATS.ini の [ATO] から調整値を読み込む(Load時に1回)
 void ATOLoadSettings(const char* iniPath) {
     ATO_AUTOSTART_AFTER_JUMP = IniBool("AutoStartAfterJump", true, iniPath);
+    ATO_NOTCH_RETURN = IniBool("PowerNotchReturn", true, iniPath);
     ATO_EXT_POWER_NOTCHES = IniInt("ExtendedPowerNotches", 0, 0, 64, iniPath);
     ATO_POWER_NOTCH = IniInt("PowerNotch", 3, 1, 64, iniPath);
     // DriverPowerMap: カンマ区切り(例: 4, 10, 17, 23, 30)
@@ -508,6 +510,8 @@ void ATOUpdate(bool atcFree, float speedKmh, int atcLimitKmh, float location, in
             notch += (int)((float)bonus * scale + 0.5f);
         }
         if (maxStep > 0 && notch > maxStep) notch = maxStep;
+        // 戻しノッチに対応していない車両: 力行中はノッチを下げない(例: P4→P1 は P4 のまま。下げるときは惰行でNに戻す)
+        if (!ATO_NOTCH_RETURN && g_ATOPower > 0 && notch < g_ATOPower) notch = g_ATOPower;
         g_ATOPower = notch;
         g_ATOActive = true;
     }

@@ -15,6 +15,8 @@ static int s_notchTimerMs = 0; // ノッチ変化タイマー (ms)
 static float s_targetLocation = -1.0f;   // 目標停止位置 (m)
 static float s_stopTolerance = 0.5f;     // 許容範囲 (m) 既定値: ±50cm (0.5m)
 static float s_pendingRelativeDist = -1.0f; // 保留中の相対距離 (m) -1.0f で保留なしを示す
+static float s_lampTarget = -1.0f;       // 定点停止灯を点けたときの停車位置 (m)。-1.0f でなし
+static float s_lampTolerance = 0.5f;     // 定点停止灯を点けたときの許容範囲 (m)
 
 // --- TASCの調整値(既定値。ATS.ini の [TASC] で上書きできます) ---
 static float TASC_DELAY_TIME_SEC = 1.0f;         // 空走時間 (秒)
@@ -361,6 +363,25 @@ void ProcessTascBeacon(int type, int optional) {
         }
     }
 }
+// 始発駅・駅ジャンプのあとの定点停止灯(地上子1041)
+static bool  s_startLampPending = false;  // 1041を受けた(止まったまま、まだ動いていない)
+static float s_startLampLoc = -1.0f;      // 1041を受けたときの位置 (m)。-1.0f は次の Elapse で決める
+static float s_startLampTol = 0.5f;       // 許容範囲 (m)
+void TascOnStationLampBeacon(int optional) {
+    s_startLampPending = true;
+    s_startLampLoc = -1.0f;
+    s_startLampTol = (optional > 0) ? (float)optional / 100.0f : g_defaultClearance;
+}
+// 毎フレーム呼ぶ: 動いたら(許容範囲を超えたら)取り消す
+void TascTrackStartLamp(float location, float speed) {
+    if (!s_startLampPending) return;
+    if (s_startLampLoc < 0.0f) {
+        if (fabsf(speed) < 0.1f) s_startLampLoc = location;  // 止まっていれば、この位置を停車位置にする
+        else s_startLampPending = false;                     // 走行中に受けたときは使わない
+        return;
+    }
+    if (fabsf(location - s_startLampLoc) > s_startLampTol) s_startLampPending = false;
+}
 // ドアが開いたらTASCをリセットする
 // g_TASCFailure変数は故障状態を保持するため、リセットしない
 void OnDoorOpen() {
@@ -370,7 +391,7 @@ void OnDoorOpen() {
     s_currentTascBrake = 0;
     s_lastTimeMs = -1;
     s_notchTimerMs = 0;
-    g_PositionEnable = false;
+    // 定点停止灯はドアが開いても消さない(停車位置から許容範囲を超えて動いたら消す)
 	s_stopTolerance = g_defaultClearance;
     // TASC/ATOモードでは、ドアが開いている間も停車保持ブレーキを掛け続ける(転動防止)
     //   INIで HoldReleaseOnDoorOpen = true のときは、ドアが開いたら緩める
@@ -413,6 +434,19 @@ void OnTascSwitchToggled(int newState) {
 // TASCブレーキ演算処理
 int CalculateTascBrake(float currentLocation, float currentSpeed, int driverBrake, int currentTimeMs) {
     UpdateMeasuredDecel(fabsf(currentSpeed), currentTimeMs);   // ★追加: 実際の減速度を測る
+    // 定点停止灯: 点灯したときの停車位置から、許容範囲を超えて動いたら消灯する
+    if (g_PositionEnable && s_lampTarget > 0.0f &&
+        fabsf(currentLocation - s_lampTarget) > s_lampTolerance) {
+        g_PositionEnable = false;
+        s_lampTarget = -1.0f;
+    }
+    // 始発駅・駅ジャンプのあと(地上子1041): ATC電源が入っていて止まっていれば点灯する
+    if (s_startLampPending && s_startLampLoc >= 0.0f && !g_PositionEnable &&
+        !s_isTascActive && fabsf(currentSpeed) < 0.1f) {
+        g_PositionEnable = true;
+        s_lampTarget = s_startLampLoc;
+        s_lampTolerance = s_startLampTol;
+    }
 	// 故障判定
 	if (g_TASC_Failure) {
 		s_currentTascBrake = 0; // 故障中はTASC制御を無効化
@@ -504,6 +538,8 @@ int CalculateTascBrake(float currentLocation, float currentSpeed, int driverBrak
         // 微低速または全停止状態であれば速やかに最大ノッチへ上げて位置確定
         if (absSpeed < 0.1f) {
             g_PositionEnable = true;
+            s_lampTarget = s_targetLocation;      // 定点停止灯: この位置から許容範囲を超えて動いたら消灯する
+            s_lampTolerance = s_stopTolerance;
             if (!s_holdActive) StartHold();   // 停車した: ドアが開いたあとも転動防止ブレーキを続ける
             s_currentTascBrake = effectiveMaxNotch; // 即座に最大ノッチ化（タイマースキップ）
             s_notchTimerMs = 0;

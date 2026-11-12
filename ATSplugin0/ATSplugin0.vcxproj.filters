@@ -50,6 +50,7 @@
       <Filter>ソース ファイル</Filter>
     </None>
     <None Include="cpp.hint" />
+    <None Include="plan.md" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="Resource.rc">

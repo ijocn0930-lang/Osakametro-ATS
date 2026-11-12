@@ -2,6 +2,8 @@
 #include "Tasc.h"
 #include "atsplugin.h"
 #include <stdlib.h>
+#include <stdio.h>
+#include <math.h>
 #include <string.h>
 #include <time.h>
 #include <vector>
@@ -113,6 +115,27 @@ const int BEACON_TASC_POSITIONRANGE = 1031; //許容範囲 センチメートル
 const int BEACON_LEVEL = 1008; //こう配補正
 const int BEACON_ATOAUTOSTART = 1003; //自動発進
 const int BEACON_SPEEDLIMIT = 1007; //速度制限
+const int BEACON_PLATFORMDOOR = 1040; //ホームドア(可動柵)の有無 Optional 1:あり 0:なし
+const int BEACON_STATIONLAMP = 1041; //始発駅・駅ジャンプのあとの定点停止灯 停車位置に置く Optional 許容範囲cm(0は既定値)
+
+// --- ホームドア(可動柵)連動パネル ---
+bool g_psdEnable = true;          // 車両がホームドア連動に対応しているか INIファイル対応 ([PlatformDoor] Enable)
+bool g_psdDefault = false;        // シナリオ開始・駅ジャンプのあと、1040を通るまでのホームドアの有無 ([PlatformDoor] DefaultStation)
+int  g_psdPanelOpen = 40;         // 可動柵開のパネル番号 ([PlatformDoor] PanelOpen)
+bool g_psdStationHas = false;     // 次に止まる駅にホームドアがあるか(地上子1040で設定)
+bool g_isDoorOpen = true;         // 車両のドアが開いているか(BVE開始時は開)
+
+// --- 現在駅・次駅・キロ程の表示 ---
+const int BEACON_STATIONINFO = 1042; // 現在駅と次駅 Optional 現在駅×1000＋次駅 (正:下り 負:上り)。停車位置に置く
+const int BEACON_KILOPOST = 1043;    // キロ程 Optional 下り: キロ程(m)−距離程(m)、上り: キロ程(m)＋距離程(m)
+bool g_stnEnable = true;          // 表示するか ([StationDisplay] Enable)
+int  g_stnPanelStart = 200;       // 駅表示の最初のパネル番号 ([StationDisplay] StationPanelStart)。号線ごとに4つ(下り現在・下り次・上り現在・上り次)
+int  g_kiloPanelStart = 240;      // キロ程の最初のパネル番号 ([StationDisplay] KiloPanelStart)。10km・1km・100m・10mの4つ
+int  g_stnCurrent = 0;            // 現在駅の番号 (0:なし)
+int  g_stnNext = 0;               // 次駅の番号 (0:なし)
+bool g_stnUp = false;             // 上りか
+bool g_kiloValid = false;         // キロ程を受信したか
+int  g_kiloOffset = 0;            // キロ程と距離程の差(m)。下り: キロ程 = 差＋距離程、上り: キロ程 = 差−距離程
 bool s_isTascActive = false; //TASC制御中かどうか
 int g_extendedNotches = 0; //拡張ノッチ段数　INIファイル対応
 float g_defaultClearance = 0.5f; //デフォルトの許容範囲　INIファイル対応
@@ -168,16 +191,275 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
     return TRUE;
 }
 
-// INIから true/false を読む(true, 1 で true)。行の後ろのコメント(; 以降)は取り除く
-static bool ReadIniBool(const char* section, const char* key, bool def, const char* iniPath) {
-    char buf[128] = { 0 };
-    GetPrivateProfileStringA(section, key, "", buf, sizeof(buf), iniPath);
+// INIの値から、行の後ろのコメント(; 以降)と末尾の空白を取り除く(Windowsはコメントを取り除かないため)
+static void StripIniComment(char* buf) {
     char* sc = strchr(buf, ';');
     if (sc != NULL) *sc = '\0';
     int len = (int)strlen(buf);
     while (len > 0 && (buf[len - 1] == ' ' || buf[len - 1] == '\t')) buf[--len] = '\0';
+}
+
+// INIから true/false を読む(true, 1 で true)。行の後ろのコメント(; 以降)は取り除く
+static bool ReadIniBool(const char* section, const char* key, bool def, const char* iniPath) {
+    char buf[128] = { 0 };
+    GetPrivateProfileStringA(section, key, "", buf, sizeof(buf), iniPath);
+    StripIniComment(buf);
     if (buf[0] == '\0') return def;
     return (_stricmp(buf, "true") == 0 || atoi(buf) != 0);
+}
+
+// --- パネルの更新間隔・反映遅延 (INI [PanelTiming] パネル番号 = 更新間隔ms, 反映遅延ms) ---
+const int PT_MAX = 32;   // 設定できるパネルの数
+const int PT_QUEUE = 64; // 反映待ちの値をためておく数
+struct PanelTiming {
+    int panel;                  // パネル番号
+    int intervalMs;             // 更新間隔(ms)。0で毎フレーム
+    int delayMs;                // 反映遅延(ms)。0で遅れなし
+    int shown;                  // 表示中の値
+    int delayed;                // 反映遅延をかけたあとの値
+    int lastUpdateMs;           // 最後に更新した時刻
+    int qTime[PT_QUEUE];        // 反映待ちの値(変わった時刻と値)
+    int qValue[PT_QUEUE];
+    int qHead, qCount;
+    int lastInput;              // 前のフレームの元の値
+    bool started;
+};
+static PanelTiming s_pt[PT_MAX];
+static int s_ptCount = 0;
+static int s_ptLastTimeMs = -1;
+
+static void LoadPanelTiming(const char* iniPath) {
+    s_ptCount = 0;
+    char buf[4096] = { 0 };
+    GetPrivateProfileSectionA("PanelTiming", buf, sizeof(buf), iniPath);
+    for (char* p = buf; *p != '\0' && s_ptCount < PT_MAX; p += strlen(p) + 1) {
+        char line[256];
+        strncpy_s(line, sizeof(line), p, _TRUNCATE);
+        StripIniComment(line);
+        char* eq = strchr(line, '=');
+        if (eq == NULL) continue;
+        *eq = '\0';
+        int panel = atoi(line);
+        if (panel < 0 || panel > 255) continue;
+        int interval = atoi(eq + 1);
+        char* comma = strchr(eq + 1, ',');
+        int delay = (comma != NULL) ? atoi(comma + 1) : 0;
+        if (interval < 0) interval = 0;
+        if (delay < 0) delay = 0;
+        if (interval == 0 && delay == 0) continue;
+        PanelTiming& t = s_pt[s_ptCount++];
+        t.panel = panel; t.intervalMs = interval; t.delayMs = delay;
+        t.started = false;
+    }
+}
+// パネル出力の最後に呼ぶ: 設定したパネルの値を、更新間隔・反映遅延に合わせて書き換える
+static void ApplyPanelTiming(int* panel, int nowMs) {
+    bool reset = (s_ptLastTimeMs < 0 || nowMs < s_ptLastTimeMs); // シナリオ開始・駅ジャンプで時刻が戻ったとき
+    s_ptLastTimeMs = nowMs;
+    for (int i = 0; i < s_ptCount; i++) {
+        PanelTiming& t = s_pt[i];
+        int input = panel[t.panel];
+        if (reset || !t.started) {
+            t.started = true;
+            t.shown = input; t.delayed = input; t.lastInput = input;
+            t.lastUpdateMs = nowMs;
+            t.qHead = 0; t.qCount = 0;
+            continue;
+        }
+        // 反映遅延: 値が変わった時刻をためておき、遅延時間がたったものから取り出す
+        if (t.delayMs > 0) {
+            if (input != t.lastInput) {
+                if (t.qCount == PT_QUEUE) { t.qHead = (t.qHead + 1) % PT_QUEUE; t.qCount--; } // あふれたら古いものを捨てる
+                int idx = (t.qHead + t.qCount) % PT_QUEUE;
+                t.qTime[idx] = nowMs; t.qValue[idx] = input; t.qCount++;
+            }
+            while (t.qCount > 0 && nowMs - t.qTime[t.qHead] >= t.delayMs) {
+                t.delayed = t.qValue[t.qHead];
+                t.qHead = (t.qHead + 1) % PT_QUEUE; t.qCount--;
+            }
+        }
+        else {
+            t.delayed = input;
+        }
+        t.lastInput = input;
+        // 更新間隔: 前に更新してから間隔がたったときだけ表示を変える
+        if (t.intervalMs <= 0 || nowMs - t.lastUpdateMs >= t.intervalMs) {
+            if (t.intervalMs > 0) t.lastUpdateMs = nowMs;
+            t.shown = t.delayed;
+        }
+        panel[t.panel] = t.shown;
+    }
+}
+
+// --- 縦バー形の計器 (INI [Gauge1]〜[Gauge8]) ---
+//   バー: 目盛りの範囲(Min〜Max)を Steps 段に分け、0〜Steps のコマ番号を出す(DigitalNumberの画像をコマごとに用意する)
+//   数字: 1桁ずつ別のパネルに出す。0=非表示 1〜10=数字0〜9。上の桁の0は非表示
+const int GAUGE_MAX = 8;
+struct GaugeSetting {
+    int source;        // 0:なし 1:BC圧 2:MR圧 3:ER圧 4:BP圧 5:SAP圧(kPa) 6:電流(A) 7:架線電圧(V)
+    float minValue, maxValue;
+    int steps;         // バーの段数(1段=1ピクセルにするなら、目盛りの高さのピクセル数)
+    int barPanel;      // バーのパネル番号(-1で使わない)。Segments 個使う(下から順に)
+    int segments;      // バーを縦に何枚に分けるか(画像の高さの上限8192pxを超えないようにするため)。1で分けない
+    int markerHalf;    // マーカーの高さの半分(px)。高さ5pxなら2
+    int digitPanel;    // 数字の最上位の桁のパネル番号(-1で使わない)。ここから Digits 個使う
+    int digits;        // 数字の桁数(1〜5)
+};
+static GaugeSetting s_gauges[GAUGE_MAX];
+// 架線電圧(ATSプラグインには渡されないので、電流から計算する)
+static float s_lvNominal = 750.0f;    // 無負荷のときの電圧(V)
+static float s_lvDropPerA = 0.05f;    // 力行電流1Aあたりの電圧降下(V)
+static float s_lvRisePerA = 0.03f;    // 回生電流1Aあたりの電圧上昇(V)
+static float s_lvMin = 650.0f, s_lvMax = 800.0f;
+// 架線電圧のゆらぎ(ほかの列車の加減速などで、停車中も少しずつ変わる)
+static float s_lvFluct = 10.0f;       // ゆらぎの大きさ(±V)。0でゆらがない
+static float s_lvFluctPeriod = 3.0f;  // 次の目標値を選ぶまでの平均の時間(秒)
+static float s_lvFluctNow = 0.0f;     // 今のゆらぎ(V)
+static float s_lvFluctTarget = 0.0f;  // 目標のゆらぎ(V)
+static int   s_lvFluctNextMs = -1;    // 次に目標を選ぶ時刻
+static int   s_lvLastMs = -1;
+
+static float IniFloat(const char* section, const char* key, float def, const char* iniPath) {
+    char buf[64] = { 0 };
+    GetPrivateProfileStringA(section, key, "", buf, sizeof(buf), iniPath);
+    StripIniComment(buf);
+    if (buf[0] == '\0') return def;
+    return (float)atof(buf);
+}
+static void LoadGauges(const char* iniPath) {
+    for (int i = 0; i < GAUGE_MAX; i++) {
+        char sec[16];
+        sprintf_s(sec, sizeof(sec), "Gauge%d", i + 1);
+        GaugeSetting& g = s_gauges[i];
+        char src[32] = { 0 };
+        GetPrivateProfileStringA(sec, "Source", "", src, sizeof(src), iniPath);
+        StripIniComment(src);
+        g.source = 0;
+        if (_stricmp(src, "bc") == 0) g.source = 1;
+        else if (_stricmp(src, "mr") == 0) g.source = 2;
+        else if (_stricmp(src, "er") == 0) g.source = 3;
+        else if (_stricmp(src, "bp") == 0) g.source = 4;
+        else if (_stricmp(src, "sap") == 0) g.source = 5;
+        else if (_stricmp(src, "current") == 0) g.source = 6;
+        else if (_stricmp(src, "voltage") == 0) g.source = 7;
+        g.minValue = IniFloat(sec, "Min", 0.0f, iniPath);
+        g.maxValue = IniFloat(sec, "Max", 1000.0f, iniPath);
+        if (g.maxValue <= g.minValue) g.maxValue = g.minValue + 1.0f;
+        g.steps = GetPrivateProfileIntA(sec, "Steps", 50, iniPath);
+        if (g.steps < 1) g.steps = 1;
+        g.segments = GetPrivateProfileIntA(sec, "Segments", 1, iniPath);
+        if (g.segments < 1) g.segments = 1;
+        if (g.segments > 8) g.segments = 8;
+        g.markerHalf = GetPrivateProfileIntA(sec, "MarkerHalf", 2, iniPath);
+        if (g.markerHalf < 0) g.markerHalf = 0;
+        g.barPanel = GetPrivateProfileIntA(sec, "BarPanel", -1, iniPath);
+        if (g.barPanel + g.segments > 256) g.barPanel = -1;
+        g.digits = GetPrivateProfileIntA(sec, "Digits", 3, iniPath);
+        if (g.digits < 1) g.digits = 1;
+        if (g.digits > 5) g.digits = 5;
+        g.digitPanel = GetPrivateProfileIntA(sec, "DigitPanel", -1, iniPath);
+        if (g.digitPanel + g.digits > 256) g.digitPanel = -1;
+    }
+    s_lvNominal = IniFloat("LineVoltage", "Nominal", 750.0f, iniPath);
+    s_lvDropPerA = IniFloat("LineVoltage", "DropPerAmp", 0.05f, iniPath);
+    s_lvRisePerA = IniFloat("LineVoltage", "RisePerAmp", 0.03f, iniPath);
+    s_lvMin = IniFloat("LineVoltage", "Min", 650.0f, iniPath);
+    s_lvMax = IniFloat("LineVoltage", "Max", 800.0f, iniPath);
+    s_lvFluct = IniFloat("LineVoltage", "Fluctuation", 10.0f, iniPath);
+    if (s_lvFluct < 0.0f) s_lvFluct = 0.0f;
+    s_lvFluctPeriod = IniFloat("LineVoltage", "FluctuationPeriod", 3.0f, iniPath);
+    if (s_lvFluctPeriod < 0.1f) s_lvFluctPeriod = 0.1f;
+}
+// 架線電圧のゆらぎを進める: ときどき新しい目標値を選び、そこへゆっくり近づける
+static void UpdateLineVoltageFluct(int nowMs) {
+    if (s_lvFluct <= 0.0f) { s_lvFluctNow = 0.0f; return; }
+    if (s_lvLastMs < 0 || nowMs < s_lvLastMs) {   // 開始・駅ジャンプで時刻が戻ったとき
+        s_lvLastMs = nowMs;
+        s_lvFluctNextMs = nowMs;
+    }
+    float dt = (nowMs - s_lvLastMs) / 1000.0f;
+    s_lvLastMs = nowMs;
+    if (nowMs >= s_lvFluctNextMs) {
+        float r = (float)rand() / (float)RAND_MAX;            // 0〜1
+        s_lvFluctTarget = (r * 2.0f - 1.0f) * s_lvFluct;      // -Fluctuation〜+Fluctuation
+        float r2 = (float)rand() / (float)RAND_MAX;
+        s_lvFluctNextMs = nowMs + (int)(s_lvFluctPeriod * (0.5f + r2) * 1000.0f); // 平均の0.5〜1.5倍
+    }
+    // 目標へ近づける(およそ1秒で差が1/3になる速さ)
+    float k = dt * 1.1f;
+    if (k > 1.0f) k = 1.0f;
+    s_lvFluctNow += (s_lvFluctTarget - s_lvFluctNow) * k;
+}
+static void OutputGauges(const ATS_VEHICLESTATE& vs, int* panel) {
+    UpdateLineVoltageFluct(vs.Time);
+    for (int i = 0; i < GAUGE_MAX; i++) {
+        const GaugeSetting& g = s_gauges[i];
+        if (g.source == 0) continue;
+        float value = 0.0f;
+        // 圧力の単位: atsplugin.h には Pa と書いてあるが、BVE5 は kPa で渡す。
+        //   念のため、MR圧が 10000 を超えていれば Pa とみなして kPa に直す
+        float pScale = (vs.MrPressure > 10000.0f) ? 0.001f : 1.0f;
+        switch (g.source) {
+        case 1: value = vs.BcPressure * pScale; break;
+        case 2: value = vs.MrPressure * pScale; break;
+        case 3: value = vs.ErPressure * pScale; break;
+        case 4: value = vs.BpPressure * pScale; break;
+        case 5: value = vs.SapPressure * pScale; break;
+        case 6: value = fabsf(vs.Current); break;          // 回生(マイナス)も大きさで表示
+        case 7: {
+            float a = vs.Current;
+            value = (a >= 0.0f) ? s_lvNominal - a * s_lvDropPerA : s_lvNominal - a * s_lvRisePerA;
+            value += s_lvFluctNow;   // ゆらぎ
+            if (value < s_lvMin) value = s_lvMin;
+            if (value > s_lvMax) value = s_lvMax;
+            break;
+        }
+        }
+        // バー
+        if (g.barPanel >= 0) {
+            float r = (value - g.minValue) / (g.maxValue - g.minValue);
+            if (r < 0.0f) r = 0.0f;
+            if (r > 1.0f) r = 1.0f;
+            int p = (int)(r * g.steps + 0.5f);   // 段の位置(0〜Steps)
+            if (g.segments <= 1) {
+                panel[g.barPanel] = p;
+            }
+            else {
+                // 縦に分けた画像ごとのコマ番号(GaugeImages\MakeGauge.ps1 と同じ計算)
+                //   0: この画像より下にマーカー(空)、最後: この画像より上にマーカー(満)、その間: 1 + (p - 見える範囲の下端)
+                //   つなぎ目の横線を防ぐため、となりの画像と2行ずつ重ね、外側の端は1行広げる
+                //   (BVEは画像を拡大するとき、コマの端の行に、となりのコマの行の色を混ぜるため)
+                int h = g.markerHalf;
+                const int OVERLAP = 2;
+                for (int j = 0; j < g.segments; j++) {
+                    int a = j * g.steps / g.segments;
+                    int b = (j + 1) * g.steps / g.segments;
+                    int lo = (j == 0) ? -h - 1 : a - OVERLAP;                          // この画像の絵の一番下の行
+                    int hi = (j == g.segments - 1) ? g.steps + h + 1 : b - 1 + OVERLAP; // この画像の絵の一番上の行
+                    int frame;
+                    if (p < lo - h) frame = 0;
+                    else if (p > hi + h) frame = (hi - lo) + 2 * h + 2;
+                    else frame = 1 + (p - (lo - h));
+                    panel[g.barPanel + j] = frame;
+                }
+            }
+        }
+        // 数字
+        if (g.digitPanel >= 0) {
+            int v = (int)(value + 0.5f);
+            if (v < 0) v = 0;
+            int div = 1;
+            for (int d = 1; d < g.digits; d++) div *= 10;
+            bool leading = true;
+            for (int d = 0; d < g.digits; d++) {
+                int digit = (v / div) % 10;
+                bool last = (d == g.digits - 1);
+                if (digit != 0 || last) leading = false;
+                panel[g.digitPanel + d] = leading ? 0 : digit + 1;
+                div /= 10;
+            }
+        }
+    }
 }
 
 static void LoadSettings()
@@ -212,6 +494,22 @@ static void LoadSettings()
         // 車両が対応するTASC/ATO(書かなければ両方とも使える)
         g_tascEnabled = ReadIniBool("VehicleSpec", "TascEnable", true, iniPath);
         g_atoEnabled = ReadIniBool("VehicleSpec", "AtoEnable", true, iniPath);
+        // ホームドア(可動柵)連動パネル
+        g_psdEnable = ReadIniBool("PlatformDoor", "Enable", true, iniPath);
+        g_psdDefault = ReadIniBool("PlatformDoor", "DefaultStation", false, iniPath);
+        g_psdPanelOpen = GetPrivateProfileIntA("PlatformDoor", "PanelOpen", 40, iniPath);
+        if (g_psdPanelOpen < 0 || g_psdPanelOpen > 255) g_psdPanelOpen = 40;
+        g_psdStationHas = g_psdDefault;
+        // 現在駅・次駅・キロ程の表示
+        g_stnEnable = ReadIniBool("StationDisplay", "Enable", true, iniPath);
+        g_stnPanelStart = GetPrivateProfileIntA("StationDisplay", "StationPanelStart", 200, iniPath);
+        if (g_stnPanelStart < 0 || g_stnPanelStart + 40 > 256) g_stnPanelStart = 200;
+        g_kiloPanelStart = GetPrivateProfileIntA("StationDisplay", "KiloPanelStart", 240, iniPath);
+        if (g_kiloPanelStart < 0 || g_kiloPanelStart + 4 > 256) g_kiloPanelStart = 240;
+        // パネルの更新間隔・反映遅延
+        LoadPanelTiming(iniPath);
+        // 縦バー形の計器
+        LoadGauges(iniPath);
 
         // --- 【新規】号線仕様の読み込み ---
         g_minLine = GetPrivateProfileIntA("LineSpec", "MinLine", 1, iniPath);
@@ -232,14 +530,7 @@ static void LoadSettings()
         if (g_yardLimitSpeed <= 0) g_yardLimitSpeed = 25;
 
         // --- ATC故障パラメータの読み込み ---
-        char failBuf[32] = { 0 };
-        GetPrivateProfileStringA("ATC", "ATCFail", "false", failBuf, sizeof(failBuf), iniPath);
-        if (_stricmp(failBuf, "true") == 0 || atoi(failBuf) == 1) {
-            g_atcFailSetting = true;
-        }
-        else {
-            g_atcFailSetting = false;
-        }
+        g_atcFailSetting = ReadIniBool("ATC", "ATCFail", false, iniPath);   // ; 以降のコメントは無視する
 
         char paramBuf[32] = { 0 };
         GetPrivateProfileStringA("ATC", "FailParameter", "0", paramBuf, sizeof(paramBuf), iniPath);
@@ -285,6 +576,7 @@ static void LoadSettings()
         // 3. INIから PressureRates カンマ区切り文字列を取得
         char pressureRatesBuf[1024] = { 0 };
         GetPrivateProfileStringA("TASC", "PressureRates", "", pressureRatesBuf, sizeof(pressureRatesBuf), iniPath);        // 3. 境界外チェック (ExtendedNotches が PressureRates を上回っている場合)
+        StripIniComment(pressureRatesBuf);   // コメントの中のカンマを数えないように、; 以降を取り除く
 
         // 4. カンマの数から PressureRates 配列の要素数を算出
         int pressureRatesCount = CountCommaSeparatedElements(pressureRatesBuf);
@@ -315,13 +607,7 @@ static void LoadSettings()
         }
         // --TASC故障関連パラメータの読み込み--
         char failurebuf[32] = { 0 };
-        GetPrivateProfileStringA("TASC", "Failure", "false", failurebuf, sizeof(failurebuf), iniPath);
-        if (_stricmp(failurebuf, "true") == 0) {
-            g_TASC_FailureActive = true;
-        }
-        else {
-            g_TASC_FailureActive = false;
-        }
+        g_TASC_FailureActive = ReadIniBool("TASC", "Failure", false, iniPath);   // ; 以降のコメントは無視する
         GetPrivateProfileStringA("TASC", "FailureRate", "0.0", failurebuf, sizeof(failurebuf), iniPath);
         g_TASC_FailureRate = (float)atof(failurebuf);
         if (g_TASC_FailureRate <= 0.0f) { // 0.0未満は無効として0.0に丸める
@@ -355,13 +641,7 @@ static void LoadSettings()
         }
         // --ATO故障関連パラメータの読み込み-- 
         char ATOfailurebuf[32] = { 0 };
-        GetPrivateProfileStringA("ATO", "Failure", "false", ATOfailurebuf, sizeof(ATOfailurebuf), iniPath);
-        if (_stricmp(ATOfailurebuf, "true") == 0) {
-            g_ATO_FailureActive = true;
-        }
-        else {
-            g_ATO_FailureActive = false;
-        }
+        g_ATO_FailureActive = ReadIniBool("ATO", "Failure", false, iniPath);   // ; 以降のコメントは無視する
         GetPrivateProfileStringA("ATO", "FailureRate", "0.0", ATOfailurebuf, sizeof(ATOfailurebuf), iniPath);
         g_ATO_FailureRate = (float)atof(ATOfailurebuf);
         if (g_ATO_FailureRate <= 0.0f) { // 0.0未満は無効として0.0に丸める
@@ -386,8 +666,7 @@ static void LoadSettings()
                     NULL,
                     "ATS.ini の [ATO] FailureRate 設定値が無効です。\n"
                     "値が大きすぎます。(許容値: 1.0 以下)\n\n"
-                    "設定値を確認してください。OKをクリックすると100%に読み替えて続行します。"
-                    "ダミー",
+                    "設定値を確認してください。OKをクリックすると100%に読み替えて続行します。",
                     "警告",
                     MB_OK | MB_ICONWARNING | MB_TOPMOST
                 );
@@ -534,6 +813,16 @@ ATS_API void WINAPI SetSignal(int signal)
             return;
         }
     }
+    // WS-ATCモード運用中にCS信号(10以降)を受信した場合も無視して、直前のWS信号を保持する(WS信号を優先)
+    //   WS信号をまだ受けていない(直前がCS信号・未受信)ときは、WSの信号がないので停止(0km/h)扱いにする
+    else if (signal >= 10) {
+        if (g_lastRawSignal < 0 || g_lastRawSignal >= 10) {
+            g_lastRawSignal = 0;
+            g_wsLimitSpeed = 0;
+            g_isAdvanceNoticeActive = false;
+        }
+        return;
+    }
     if (signal != g_lastRawSignal) {
 		g_isAdvanceNoticeActive = false; // 信号が変化したら前方予告フラグをリセット
     }
@@ -665,6 +954,27 @@ ATS_API void WINAPI SetBeaconData(ATS_BEACONDATA beaconData)
 	// ATO自動運転開始地上子を受信した場合、ATO自動運転を開始する
 	if (beaconData.Type == BEACON_ATOAUTOSTART) {
 		ATOOnAutoStartBeacon();
+	}
+	// ホームドア(可動柵)の有無を受信した場合(次に止まる駅の設定)
+	if (beaconData.Type == BEACON_PLATFORMDOOR) {
+		g_psdStationHas = (beaconData.Optional != 0);
+	}
+	// 始発駅・駅ジャンプのあとの定点停止灯(停車位置に置く。Optional: 許容範囲cm、0は既定値)
+	if (beaconData.Type == BEACON_STATIONLAMP) {
+		TascOnStationLampBeacon(beaconData.Optional);
+	}
+	// 現在駅と次駅 (Optional: 現在駅×1000＋次駅。負の値は上り)
+	if (beaconData.Type == BEACON_STATIONINFO) {
+		int v = beaconData.Optional;
+		g_stnUp = (v < 0);
+		if (v < 0) v = -v;
+		g_stnCurrent = v / 1000;
+		g_stnNext = v % 1000;
+	}
+	// キロ程 (Optional: キロ程と距離程の差(m))。地上子の位置に関係なく、距離程から計算する
+	if (beaconData.Type == BEACON_KILOPOST) {
+		g_kiloOffset = beaconData.Optional;
+		g_kiloValid = true;
 	}
 
 	// 速度制限地上子を受信した場合、ATOの速度制限を更新する
@@ -824,7 +1134,7 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
 
     // 現在の位置を保持
     g_lastLocation = vehicleState.Location;
-	// --- 0. 運転士のハンドル位置を一時変数にコピー ---
+    TascTrackStartLamp(vehicleState.Location, vehicleState.Speed); // 地上子1041の位置から動いたら取り消す	// --- 0. 運転士のハンドル位置を一時変数にコピー ---
     int outputPower = g_driverPower;
     int outputBrake = g_driverBrake;
     // 【重要】現在選択されているアクティブなモードに応じて、採用する制限速度をパチッと切り替える
@@ -1121,11 +1431,40 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
     panel[PANEL_ATO_FAILURE] = (g_ATO_Failure && g_isAtcPowerOn && g_TASCATOSet == 2) ? 1 : 0;
     panel[PANEL_ATO_AUTOSTART] = ATOIsAutoStartReady() ? 1 : 0;
     panel[PANEL_INCHING] = TascIsInching() ? 1 : 0;   // インチング中表示灯
+    // 可動柵開(ホームドア連動): ホームドアのある駅で、車両のドアが開いている間だけ点灯
+    //   INIで Enable = false の車両(非対応)では常に消灯
+    panel[g_psdPanelOpen] = (g_psdEnable && g_psdStationHas && g_isDoorOpen) ? 1 : 0;
+
+    // 現在駅・次駅 (号線ごとに4つ: 下り現在・下り次・上り現在・上り次)。選択中の号線と方向だけ駅番号を出し、ほかは0(非表示)
+    for (int i = 0; i < 40; i++) panel[g_stnPanelStart + i] = 0;
+    if (g_stnEnable && g_currentLine >= 1 && g_currentLine <= 10) {
+        int base = g_stnPanelStart + (g_currentLine - 1) * 4 + (g_stnUp ? 2 : 0);
+        panel[base] = g_stnCurrent;
+        panel[base + 1] = g_stnNext;
+    }
+    // キロ程 (4桁: 10km・1km・100m・10m)。0=非表示、1以降=数字0〜9。10kmの桁が0のときは非表示
+    for (int i = 0; i < 4; i++) panel[g_kiloPanelStart + i] = 0;
+    if (g_stnEnable && g_kiloValid) {
+        double loc = vehicleState.Location;
+        double kilo = g_stnUp ? g_kiloOffset - loc : g_kiloOffset + loc;   // 上りはキロ程が減る
+        if (kilo < 0.0) kilo = 0.0;
+        int v = (int)(kilo / 10.0);                              // 10m単位
+        int d10km = (v / 1000) % 10;
+        panel[g_kiloPanelStart]     = (d10km > 0) ? d10km + 1 : 0;
+        panel[g_kiloPanelStart + 1] = (v / 100) % 10 + 1;
+        panel[g_kiloPanelStart + 2] = (v / 10) % 10 + 1;
+        panel[g_kiloPanelStart + 3] = v % 10 + 1;
+    }
 
     if (g_shouldPlayBell) {
         sound[1] = ATS_SOUND_PLAY; // 1番のインデックスに単発再生命令（1）を送る
         g_shouldPlayBell = false;  // 鳴らしたら即座にフラグを戻す（1フレームだけ鳴らすため）
     }
+
+    // 縦バー形の計器 (INI [Gauge1]〜[Gauge8])
+    OutputGauges(vehicleState, panel);
+    // パネルの更新間隔・反映遅延 (INI [PanelTiming])。パネル出力をすべて決めたあとに掛ける
+    ApplyPanelTiming(panel, currentTimeMs);
 
     return handles;
 }
@@ -1138,10 +1477,12 @@ ATS_API void WINAPI KeyUp(int key) {
 }
 ATS_API void WINAPI DoorOpen()
 {
+    g_isDoorOpen = true;
     OnDoorOpen();
 	ATOOnDoorOpen();
 }
 ATS_API void WINAPI DoorClose() {
+	g_isDoorOpen = false;
 	TascOnDoorClose(); // 転動防止ブレーキ(INIの設定でドアが閉まったら緩める)
 	ATOOnDoorClose();
 }
@@ -1160,6 +1501,8 @@ ATS_API void WINAPI Initialize(int key)
 	InitTasc(); // TASCの内部状態をリセット
 	TascArmHold(); // 止まっていれば、TASC/ATOモードにしたとき転動防止ブレーキを掛ける
 	ATOOnInitialize(); // 駅ジャンプ後も、ドアが閉まったら自動発進できるようにする
+	g_psdStationHas = g_psdDefault; // 駅ジャンプでは1040を通らないので、INIの DefaultStation に戻す
+	s_ptLastTimeMs = -1; // パネルの更新間隔・反映遅延: 駅ジャンプのあとは、すぐに今の値を表示する
 	if (g_isInNagataStation) {
 		g_isInNagataStation = false; // 長田駅エリアフラグをリセット
 	}

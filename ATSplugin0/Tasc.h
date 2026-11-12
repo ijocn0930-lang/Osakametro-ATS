@@ -29,6 +29,8 @@ void TascOnDoorClose(); // ドアが閉まったとき(INIの設定で転動防�
 void TascArmHold(); // シナリオ開始・駅ジャンプ・モード切替のあと、止まっていれば転動防止ブレーキを掛ける
 int CalculateTascBrake(float currentLocation, float currentSpeed, int driverBrake, int currentTimeMs); // TASCブレーキ演算処理
 void OnDoorOpen(); // ドアが開いたらTASCをリセットする
+void TascOnStationLampBeacon(int optional); // 地上子1041(始発駅・駅ジャンプのあとの定点停止灯)
+void TascTrackStartLamp(float location, float speed); // 毎フレーム: 1041の位置から動いたら取り消す
 bool IsTascActive(); // ★追加: TASC作動中フラグの取得関数
 void ProcessTascBeacon(int type, int optional); // ★追加: 地上子データの処理
 bool CheckRandomFailure(); // ★追加: TASC故障確率判定関数

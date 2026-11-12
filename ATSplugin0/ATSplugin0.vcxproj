@@ -177,6 +177,10 @@
   <ItemGroup>
     <None Include="Ats.def" />
     <None Include="cpp.hint" />
+    <None Include="plan.md">
+      <SubType>
+      </SubType>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="Resource.rc" />
