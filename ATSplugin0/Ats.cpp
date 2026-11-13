@@ -124,6 +124,54 @@ bool g_psdDefault = false;        // シナリオ開始・駅ジャンプのあ�
 int  g_psdPanelOpen = 40;         // 可動柵開のパネル番号 ([PlatformDoor] PanelOpen)
 bool g_psdStationHas = false;     // 次に止まる駅にホームドアがあるか(地上子1040で設定)
 bool g_isDoorOpen = true;         // 車両のドアが開いているか(BVE開始時は開)
+// ホームドアの開閉の動き(車両のドアが開いたら開き、車両のドアが閉まったあとに閉まる)
+enum PsdState { PSD_CLOSED = 0, PSD_OPENING = 1, PSD_OPEN = 2, PSD_CLOSING = 3 };
+int   g_psdState = PSD_CLOSED;     // ホームドアの状態
+int   g_psdStateUntilMs = 0;       // 今の動き(待ち・開閉中)が終わる時刻
+bool  g_psdWaitOpen = false;       // 車両のドアが開いた: OpenDelay のあとに開き始める
+bool  g_psdWaitClose = false;      // 車両のドアが閉まった: CloseDelay のあとに閉まり始める
+bool  g_psdInstant = true;         // シナリオ開始・駅ジャンプの直後(このときは動きなしで開いた状態にする)
+bool  g_psdDoorOpenEvent = false;  // DoorOpen を受けた(次の Elapse で処理する)
+bool  g_psdDoorCloseEvent = false; // DoorClose を受けた(次の Elapse で処理する)
+float g_psdOpenDelay = 0.0f;       // 車両のドアが開いてから、ホームドアが開き始めるまで(秒) ([PlatformDoor] OpenDelay)
+float g_psdOpenTime = 3.0f;        // ホームドアが開き終わるまで(秒) ([PlatformDoor] OpenTime)
+float g_psdCloseDelay = 1.0f;      // 車両のドアが閉まってから、ホームドアが閉まり始めるまで(秒) ([PlatformDoor] CloseDelay)
+float g_psdCloseTime = 3.0f;       // ホームドアが閉まり終わるまで(秒) ([PlatformDoor] CloseTime)
+int   g_psdSoundOpen = -1;         // 開き始めるときの音の番号(-1で鳴らさない) ([PlatformDoor] SoundOpen)
+int   g_psdSoundClose = -1;        // 閉まり始めるときの音の番号 ([PlatformDoor] SoundClose)
+int   g_psdPanelState = -1;        // 状態のパネル番号(-1で使わない) 0:閉 1:開いている途中 2:開 3:閉まっている途中 ([PlatformDoor] PanelState)
+
+// --- 母線引き通し表示灯 ---
+//   サードレールのない区間(絶縁・分岐器)を地上子1044で知らせる。M車の集電靴が1つでも区間に入ると消灯する
+const int BEACON_NORAIL = 1044;   // サードレールのない区間 Optional: この地上子からの区間の長さ(cm)
+const int BUS_SHOE_MAX = 32;
+const int BUS_GAP_MAX = 32;
+bool  g_busEnable = true;         // ([BusLine] Enable)
+int   g_busPanel = 197;           // 表示灯のパネル番号 ([BusLine] Panel)
+float g_busOnSpeed = 5.0f;        // この速度(km/h)以上で点灯(doorLock.dll から引き継ぎ) ([BusLine] OnSpeed)
+// --- 停電 ---
+//   地上子1046で停電区間を知らせる(Optional 1: ここから停電、0: ここで復旧)
+//   停電中: 架線電圧 0V、電流計 0A、母線引き通し表示灯は消灯、力行しない
+const int BEACON_OUTAGE = 1046;
+bool g_powerOutage = false;
+bool g_outageCutRegen = true;     // 停電中はレバーサーを中立にして、電気(回生)ブレーキを止める ([Outage] CutRegen)
+// --- 回生失効 ---
+//   回生ブレーキ中に架線電圧が上限を超えたら回生失効。ブレーキを緩めるまで電気ブレーキを止める(空気ブレーキだけ)
+bool  g_regenFailEnable = true;   // ([RegenFail] Enable)
+float g_regenFailLimit = 790.0f;  // この架線電圧(V)を超えたら回生失効 ([RegenFail] Limit)
+int   g_regenFailPanel = -1;      // 回生失効の表示灯のパネル番号(-1で使わない) ([RegenFail] Panel)
+bool  g_regenFail = false;        // 回生失効中か
+float g_busShoes[BUS_SHOE_MAX];   // M車の集電靴の位置(先頭からの距離 m) ([BusLine] ShoePositions)
+int   g_busShoeCount = 0;
+float g_busGapStart[BUS_GAP_MAX]; // サードレールのない区間(距離程 m)
+float g_busGapEnd[BUS_GAP_MAX];
+int   g_busGapCount = 0;
+
+// --- 分けた画像のメーター(8192pxを超える DigitalNumber を、何枚かの画像に分けて重ねる) ---
+//   GaugeImages\SplitStrip.ps1 で分けた画像用。どの画像も0番目のコマは空、1番目以降がその画像の受け持つ値
+int g_splitPanel = -1;            // 最初のパネル番号(-1で使わない) ([SplitMeter] Panel)
+int g_splitParts = 3;             // 画像の枚数 ([SplitMeter] Parts)
+int g_splitPerPart = 82;          // 1枚が受け持つ値の数 ([SplitMeter] PerPart)
 
 // --- 現在駅・次駅・キロ程の表示 ---
 const int BEACON_STATIONINFO = 1042; // 現在駅と次駅 Optional 現在駅×1000＋次駅 (正:下り 負:上り)。停車位置に置く
@@ -296,7 +344,7 @@ static void ApplyPanelTiming(int* panel, int nowMs) {
 //   数字: 1桁ずつ別のパネルに出す。0=非表示 1〜10=数字0〜9。上の桁の0は非表示
 const int GAUGE_MAX = 8;
 struct GaugeSetting {
-    int source;        // 0:なし 1:BC圧 2:MR圧 3:ER圧 4:BP圧 5:SAP圧(kPa) 6:電流(A) 7:架線電圧(V)
+    int source;        // 0:なし 1:BC圧 2:MR圧 3:ER圧 4:BP圧 5:SAP圧(kPa) 6:電流(A) 7:架線電圧(V) 8:制御電圧(V)
     float minValue, maxValue;
     int steps;         // バーの段数(1段=1ピクセルにするなら、目盛りの高さのピクセル数)
     int barPanel;      // バーのパネル番号(-1で使わない)。Segments 個使う(下から順に)
@@ -311,13 +359,30 @@ static float s_lvNominal = 750.0f;    // 無負荷のときの電圧(V)
 static float s_lvDropPerA = 0.05f;    // 力行電流1Aあたりの電圧降下(V)
 static float s_lvRisePerA = 0.03f;    // 回生電流1Aあたりの電圧上昇(V)
 static float s_lvMin = 650.0f, s_lvMax = 800.0f;
-// 架線電圧のゆらぎ(ほかの列車の加減速などで、停車中も少しずつ変わる)
-static float s_lvFluct = 10.0f;       // ゆらぎの大きさ(±V)。0でゆらがない
-static float s_lvFluctPeriod = 3.0f;  // 次の目標値を選ぶまでの平均の時間(秒)
-static float s_lvFluctNow = 0.0f;     // 今のゆらぎ(V)
-static float s_lvFluctTarget = 0.0f;  // 目標のゆらぎ(V)
-static int   s_lvFluctNextMs = -1;    // 次に目標を選ぶ時刻
-static int   s_lvLastMs = -1;
+// ゆらぎ(停車中も少しずつ変わる): ときどき新しい目標値を選び、そこへゆっくり近づける
+struct Fluctuation {
+    float amp = 0.0f;       // ゆらぎの大きさ(±)。0でゆらがない
+    float period = 3.0f;    // 次の目標値を選ぶまでの平均の時間(秒)
+    float now = 0.0f;       // 今のゆらぎ
+    float target = 0.0f;    // 目標のゆらぎ
+    int nextMs = -1;        // 次に目標を選ぶ時刻
+    int lastMs = -1;
+};
+static Fluctuation s_lvFluct;   // 架線電圧のゆらぎ(ほかの列車の加減速など)
+// 変電所(地上子1045で位置を知らせる)。変電所に近いほど電圧が高く、離れるほど力行での電圧降下が大きい
+const int SUBSTATION_MAX = 64;
+static float s_subPos[SUBSTATION_MAX];  // 変電所の位置(距離程 m)
+static int   s_subCount = 0;
+static float s_subRise = 30.0f;         // 変電所の真横での電圧の上がり(V) ([LineVoltage] SubstationRise)
+static float s_subRange = 2000.0f;      // 変電所の効きが届く距離(m) ([LineVoltage] SubstationRange)
+void AddSubstation(float pos) {
+    for (int i = 0; i < s_subCount; i++) if (fabsf(s_subPos[i] - pos) < 1.0f) return;  // 同じ変電所は1回だけ
+    if (s_subCount < SUBSTATION_MAX) s_subPos[s_subCount++] = pos;
+}
+// 制御電圧(SIV・蓄電池からの直流。ATSプラグインには渡されないので、設定値にゆらぎを足して出す)
+static float s_cvNominal = 100.0f;    // ふだんの電圧(V)
+static float s_cvMin = 0.0f, s_cvMax = 150.0f;
+static Fluctuation s_cvFluct;
 
 static float IniFloat(const char* section, const char* key, float def, const char* iniPath) {
     char buf[64] = { 0 };
@@ -342,6 +407,7 @@ static void LoadGauges(const char* iniPath) {
         else if (_stricmp(src, "sap") == 0) g.source = 5;
         else if (_stricmp(src, "current") == 0) g.source = 6;
         else if (_stricmp(src, "voltage") == 0) g.source = 7;
+        else if (_stricmp(src, "control") == 0) g.source = 8;
         g.minValue = IniFloat(sec, "Min", 0.0f, iniPath);
         g.maxValue = IniFloat(sec, "Max", 1000.0f, iniPath);
         if (g.maxValue <= g.minValue) g.maxValue = g.minValue + 1.0f;
@@ -365,33 +431,66 @@ static void LoadGauges(const char* iniPath) {
     s_lvRisePerA = IniFloat("LineVoltage", "RisePerAmp", 0.03f, iniPath);
     s_lvMin = IniFloat("LineVoltage", "Min", 650.0f, iniPath);
     s_lvMax = IniFloat("LineVoltage", "Max", 800.0f, iniPath);
-    s_lvFluct = IniFloat("LineVoltage", "Fluctuation", 10.0f, iniPath);
-    if (s_lvFluct < 0.0f) s_lvFluct = 0.0f;
-    s_lvFluctPeriod = IniFloat("LineVoltage", "FluctuationPeriod", 3.0f, iniPath);
-    if (s_lvFluctPeriod < 0.1f) s_lvFluctPeriod = 0.1f;
+    s_lvFluct.amp = IniFloat("LineVoltage", "Fluctuation", 10.0f, iniPath);
+    if (s_lvFluct.amp < 0.0f) s_lvFluct.amp = 0.0f;
+    s_lvFluct.period = IniFloat("LineVoltage", "FluctuationPeriod", 3.0f, iniPath);
+    if (s_lvFluct.period < 0.1f) s_lvFluct.period = 0.1f;
+    s_subRise = IniFloat("LineVoltage", "SubstationRise", 30.0f, iniPath);
+    s_subRange = IniFloat("LineVoltage", "SubstationRange", 2000.0f, iniPath);
+    if (s_subRange < 1.0f) s_subRange = 1.0f;
+    // 制御電圧
+    s_cvNominal = IniFloat("ControlVoltage", "Nominal", 100.0f, iniPath);
+    s_cvMin = IniFloat("ControlVoltage", "Min", 0.0f, iniPath);
+    s_cvMax = IniFloat("ControlVoltage", "Max", 150.0f, iniPath);
+    s_cvFluct.amp = IniFloat("ControlVoltage", "Fluctuation", 1.0f, iniPath);
+    if (s_cvFluct.amp < 0.0f) s_cvFluct.amp = 0.0f;
+    s_cvFluct.period = IniFloat("ControlVoltage", "FluctuationPeriod", 5.0f, iniPath);
+    if (s_cvFluct.period < 0.1f) s_cvFluct.period = 0.1f;
 }
-// 架線電圧のゆらぎを進める: ときどき新しい目標値を選び、そこへゆっくり近づける
-static void UpdateLineVoltageFluct(int nowMs) {
-    if (s_lvFluct <= 0.0f) { s_lvFluctNow = 0.0f; return; }
-    if (s_lvLastMs < 0 || nowMs < s_lvLastMs) {   // 開始・駅ジャンプで時刻が戻ったとき
-        s_lvLastMs = nowMs;
-        s_lvFluctNextMs = nowMs;
+// ゆらぎを進める: ときどき新しい目標値を選び、そこへゆっくり近づける
+static void UpdateFluctuation(Fluctuation& f, int nowMs) {
+    if (f.amp <= 0.0f) { f.now = 0.0f; return; }
+    if (f.lastMs < 0 || nowMs < f.lastMs) {   // 開始・駅ジャンプで時刻が戻ったとき
+        f.lastMs = nowMs;
+        f.nextMs = nowMs;
     }
-    float dt = (nowMs - s_lvLastMs) / 1000.0f;
-    s_lvLastMs = nowMs;
-    if (nowMs >= s_lvFluctNextMs) {
+    float dt = (nowMs - f.lastMs) / 1000.0f;
+    f.lastMs = nowMs;
+    if (nowMs >= f.nextMs) {
         float r = (float)rand() / (float)RAND_MAX;            // 0〜1
-        s_lvFluctTarget = (r * 2.0f - 1.0f) * s_lvFluct;      // -Fluctuation〜+Fluctuation
+        f.target = (r * 2.0f - 1.0f) * f.amp;                 // -amp〜+amp
         float r2 = (float)rand() / (float)RAND_MAX;
-        s_lvFluctNextMs = nowMs + (int)(s_lvFluctPeriod * (0.5f + r2) * 1000.0f); // 平均の0.5〜1.5倍
+        f.nextMs = nowMs + (int)(f.period * (0.5f + r2) * 1000.0f); // 平均の0.5〜1.5倍
     }
     // 目標へ近づける(およそ1秒で差が1/3になる速さ)
     float k = dt * 1.1f;
     if (k > 1.0f) k = 1.0f;
-    s_lvFluctNow += (s_lvFluctTarget - s_lvFluctNow) * k;
+    f.now += (f.target - f.now) * k;
+}
+// 架線電圧の計算(Min/Max で切る前の値)。計器の表示と、回生失効の判定に使う
+static float LineVoltageRaw(const ATS_VEHICLESTATE& vs) {
+    float a = vs.Current;
+    // 変電所からの距離: 近いほど電圧が高く、電流による上下が小さい(変電所を知らないときは今までどおり)
+    float base = s_lvNominal;
+    float loadScale = 1.0f;
+    if (s_subCount > 0) {
+        float d = 1.0e9f;
+        for (int s = 0; s < s_subCount; s++) {
+            float dd = fabsf((float)vs.Location - s_subPos[s]);
+            if (dd < d) d = dd;
+        }
+        // ※ 変数名に far は使えない(windows.h で別の意味に決められている)
+        float distRatio = d / s_subRange;        // 0: 変電所の真横 〜 1: 効きが届かない
+        if (distRatio > 1.0f) distRatio = 1.0f;
+        base += s_subRise * (1.0f - distRatio);
+        loadScale = 0.5f + distRatio;            // 真横で0.5倍 〜 遠いと1.5倍
+    }
+    float v = (a >= 0.0f) ? base - a * s_lvDropPerA * loadScale : base - a * s_lvRisePerA * loadScale;
+    return v + s_lvFluct.now;   // ゆらぎ
 }
 static void OutputGauges(const ATS_VEHICLESTATE& vs, int* panel) {
-    UpdateLineVoltageFluct(vs.Time);
+    UpdateFluctuation(s_lvFluct, vs.Time);
+    UpdateFluctuation(s_cvFluct, vs.Time);
     for (int i = 0; i < GAUGE_MAX; i++) {
         const GaugeSetting& g = s_gauges[i];
         if (g.source == 0) continue;
@@ -405,15 +504,19 @@ static void OutputGauges(const ATS_VEHICLESTATE& vs, int* panel) {
         case 3: value = vs.ErPressure * pScale; break;
         case 4: value = vs.BpPressure * pScale; break;
         case 5: value = vs.SapPressure * pScale; break;
-        case 6: value = fabsf(vs.Current); break;          // 回生(マイナス)も大きさで表示
+        case 6: value = g_powerOutage ? 0.0f : fabsf(vs.Current); break;   // 回生(マイナス)も大きさで表示。停電中は0A
         case 7: {
-            float a = vs.Current;
-            value = (a >= 0.0f) ? s_lvNominal - a * s_lvDropPerA : s_lvNominal - a * s_lvRisePerA;
-            value += s_lvFluctNow;   // ゆらぎ
+            value = LineVoltageRaw(vs);
             if (value < s_lvMin) value = s_lvMin;
             if (value > s_lvMax) value = s_lvMax;
+            if (g_powerOutage) value = 0.0f;   // 停電中は0V(Min より下でも0にする)
             break;
         }
+        case 8:   // 制御電圧
+            value = s_cvNominal + s_cvFluct.now;
+            if (value < s_cvMin) value = s_cvMin;
+            if (value > s_cvMax) value = s_cvMax;
+            break;
         }
         // バー
         if (g.barPanel >= 0) {
@@ -500,6 +603,64 @@ static void LoadSettings()
         g_psdPanelOpen = GetPrivateProfileIntA("PlatformDoor", "PanelOpen", 40, iniPath);
         if (g_psdPanelOpen < 0 || g_psdPanelOpen > 255) g_psdPanelOpen = 40;
         g_psdStationHas = g_psdDefault;
+        {
+            char b[64];
+            GetPrivateProfileStringA("PlatformDoor", "OpenDelay", "0", b, sizeof(b), iniPath);  g_psdOpenDelay = (float)atof(b);
+            GetPrivateProfileStringA("PlatformDoor", "OpenTime", "3", b, sizeof(b), iniPath);   g_psdOpenTime = (float)atof(b);
+            GetPrivateProfileStringA("PlatformDoor", "CloseDelay", "1", b, sizeof(b), iniPath); g_psdCloseDelay = (float)atof(b);
+            GetPrivateProfileStringA("PlatformDoor", "CloseTime", "3", b, sizeof(b), iniPath);  g_psdCloseTime = (float)atof(b);
+            if (g_psdOpenDelay < 0.0f) g_psdOpenDelay = 0.0f;
+            if (g_psdOpenTime < 0.0f) g_psdOpenTime = 0.0f;
+            if (g_psdCloseDelay < 0.0f) g_psdCloseDelay = 0.0f;
+            if (g_psdCloseTime < 0.0f) g_psdCloseTime = 0.0f;
+        }
+        g_psdSoundOpen = GetPrivateProfileIntA("PlatformDoor", "SoundOpen", -1, iniPath);
+        if (g_psdSoundOpen > 255) g_psdSoundOpen = -1;
+        g_psdSoundClose = GetPrivateProfileIntA("PlatformDoor", "SoundClose", -1, iniPath);
+        if (g_psdSoundClose > 255) g_psdSoundClose = -1;
+        g_psdPanelState = GetPrivateProfileIntA("PlatformDoor", "PanelState", -1, iniPath);
+        if (g_psdPanelState > 255) g_psdPanelState = -1;
+        // 分けた画像のメーター(速度計)
+        g_splitPanel = GetPrivateProfileIntA("SplitMeter", "Panel", -1, iniPath);
+        g_splitParts = GetPrivateProfileIntA("SplitMeter", "Parts", 3, iniPath);
+        g_splitPerPart = GetPrivateProfileIntA("SplitMeter", "PerPart", 82, iniPath);
+        if (g_splitParts < 1) g_splitParts = 1;
+        if (g_splitPerPart < 1) g_splitPerPart = 1;
+        if (g_splitPanel + g_splitParts > 256) g_splitPanel = -1;
+        // 停電
+        g_outageCutRegen = ReadIniBool("Outage", "CutRegen", true, iniPath);
+        // 回生失効
+        g_regenFailEnable = ReadIniBool("RegenFail", "Enable", true, iniPath);
+        {
+            char b[64] = { 0 };
+            GetPrivateProfileStringA("RegenFail", "Limit", "790", b, sizeof(b), iniPath);
+            g_regenFailLimit = (float)atof(b);
+        }
+        g_regenFailPanel = GetPrivateProfileIntA("RegenFail", "Panel", -1, iniPath);
+        if (g_regenFailPanel > 255) g_regenFailPanel = -1;
+        // 母線引き通し表示灯
+        g_busEnable = ReadIniBool("BusLine", "Enable", true, iniPath);
+        g_busPanel = GetPrivateProfileIntA("BusLine", "Panel", 197, iniPath);
+        if (g_busPanel < 0 || g_busPanel > 255) g_busPanel = 197;
+        {
+            char b[64] = { 0 };
+            GetPrivateProfileStringA("BusLine", "OnSpeed", "5", b, sizeof(b), iniPath);
+            g_busOnSpeed = (float)atof(b);
+            if (g_busOnSpeed < 0.0f) g_busOnSpeed = 0.0f;
+        }
+        {
+            char b[512] = { 0 };
+            GetPrivateProfileStringA("BusLine", "ShoePositions", "", b, sizeof(b), iniPath);
+            StripIniComment(b);
+            g_busShoeCount = 0;
+            char* p = b;
+            while (*p != '\0' && g_busShoeCount < BUS_SHOE_MAX) {
+                while (*p == ' ' || *p == ',') p++;
+                if (*p == '\0') break;
+                g_busShoes[g_busShoeCount++] = (float)atof(p);
+                while (*p != '\0' && *p != ',') p++;
+            }
+        }
         // 現在駅・次駅・キロ程の表示
         g_stnEnable = ReadIniBool("StationDisplay", "Enable", true, iniPath);
         g_stnPanelStart = GetPrivateProfileIntA("StationDisplay", "StationPanelStart", 200, iniPath);
@@ -963,6 +1124,22 @@ ATS_API void WINAPI SetBeaconData(ATS_BEACONDATA beaconData)
 	if (beaconData.Type == BEACON_STATIONLAMP) {
 		TascOnStationLampBeacon(beaconData.Optional);
 	}
+	// 停電区間 (Optional 1: ここから停電、0: ここで復旧)
+	if (beaconData.Type == BEACON_OUTAGE) {
+		g_powerOutage = (beaconData.Optional != 0);
+	}
+	// 変電所の位置 (Optional: 変電所の距離程(m))。位置を直接書くので、どこで受けてもよい
+	if (beaconData.Type == 1045 && beaconData.Optional > 0) {
+		AddSubstation((float)beaconData.Optional);
+	}
+	// サードレールのない区間 (Optional: この地上子からの長さcm)
+	//   駅ジャンプの直後に止まったまま届いたものは、通過したものではないので使わない
+	if (beaconData.Type == BEACON_NORAIL && beaconData.Optional > 0 && fabsf(g_speed) >= 0.1f
+		&& g_busGapCount < BUS_GAP_MAX && g_lastLocation >= 0.0f) {
+		g_busGapStart[g_busGapCount] = g_lastLocation;
+		g_busGapEnd[g_busGapCount] = g_lastLocation + beaconData.Optional / 100.0f;
+		g_busGapCount++;
+	}
 	// 現在駅と次駅 (Optional: 現在駅×1000＋次駅。負の値は上り)
 	if (beaconData.Type == BEACON_STATIONINFO) {
 		int v = beaconData.Optional;
@@ -1284,6 +1461,24 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
     }
 
 	// --- 6. ハンドル出力の設定 ---
+    if (g_powerOutage) {
+        outputPower = 0;                              // 停電中は力行しない
+        if (g_outageCutRegen) outputReverser = 0;     // 回生ブレーキも使えないので、レバーサーを中立にして電気ブレーキを止める(空気ブレーキだけになる)
+    }
+    // 回生失効: 回生ブレーキ中(電流がマイナス)に架線電圧が上限を超えたら失効。ブレーキを緩める・力行する・止まるまで続く
+    if (g_regenFailEnable && !g_powerOutage) {
+        if (!g_regenFail && outputBrake > 0 && vehicleState.Current < 0.0f
+            && LineVoltageRaw(vehicleState) > g_regenFailLimit) {
+            g_regenFail = true;
+        }
+        if (g_regenFail && (outputBrake == 0 || outputPower > 0 || fabsf(vehicleState.Speed) < 1.0f)) {
+            g_regenFail = false;
+        }
+        if (g_regenFail) outputReverser = 0;          // 電気ブレーキを止める(空気ブレーキだけになる)
+    }
+    else {
+        g_regenFail = false;
+    }
     handles.Power = outputPower;
     handles.Brake = outputBrake;
     handles.Reverser = outputReverser;
@@ -1433,7 +1628,107 @@ ATS_API ATS_HANDLES WINAPI Elapse(ATS_VEHICLESTATE vehicleState, int* panel, int
     panel[PANEL_INCHING] = TascIsInching() ? 1 : 0;   // インチング中表示灯
     // 可動柵開(ホームドア連動): ホームドアのある駅で、車両のドアが開いている間だけ点灯
     //   INIで Enable = false の車両(非対応)では常に消灯
-    panel[g_psdPanelOpen] = (g_psdEnable && g_psdStationHas && g_isDoorOpen) ? 1 : 0;
+    // ホームドアの開閉の動き
+    {
+        bool active = g_psdEnable && g_psdStationHas;
+        if (g_psdSoundOpen >= 0) sound[g_psdSoundOpen] = ATS_SOUND_CONTINUE;
+        if (g_psdSoundClose >= 0) sound[g_psdSoundClose] = ATS_SOUND_CONTINUE;
+        if (g_psdDoorOpenEvent) {
+            g_psdDoorOpenEvent = false;
+            g_psdWaitClose = false;
+            if (active && g_psdInstant) {          // シナリオ開始・駅ジャンプ直後: すでに開いている
+                g_psdState = PSD_OPEN;
+                g_psdWaitOpen = false;
+            }
+            else if (active && g_psdState != PSD_OPEN && g_psdState != PSD_OPENING) {
+                g_psdWaitOpen = true;
+                g_psdStateUntilMs = currentTimeMs + (int)(g_psdOpenDelay * 1000.0f);
+            }
+        }
+        if (g_psdDoorCloseEvent) {
+            g_psdDoorCloseEvent = false;
+            g_psdWaitOpen = false;
+            if (g_psdState == PSD_OPEN || g_psdState == PSD_OPENING) {
+                g_psdWaitClose = true;
+                g_psdStateUntilMs = currentTimeMs + (int)(g_psdCloseDelay * 1000.0f);
+            }
+        }
+        if (g_psdInstant && fabsf(vehicleState.Speed) > 1.0f) g_psdInstant = false;
+        // 駅ジャンプ直後に1040があとから届いたとき: 車両のドアが開いていれば、ホームドアも開いた状態にする
+        if (active && g_psdInstant && g_isDoorOpen && g_psdState == PSD_CLOSED && !g_psdWaitOpen) {
+            g_psdState = PSD_OPEN;
+        }
+        if (!active) {                              // ホームドアのない駅・非対応車両: いつも閉
+            g_psdState = PSD_CLOSED;
+            g_psdWaitOpen = g_psdWaitClose = false;
+        }
+        else if (g_psdWaitOpen && currentTimeMs >= g_psdStateUntilMs) {
+            g_psdWaitOpen = false;
+            g_psdState = PSD_OPENING;
+            g_psdStateUntilMs = currentTimeMs + (int)(g_psdOpenTime * 1000.0f);
+            if (g_psdSoundOpen >= 0) sound[g_psdSoundOpen] = ATS_SOUND_PLAY;
+        }
+        else if (g_psdWaitClose && currentTimeMs >= g_psdStateUntilMs) {
+            g_psdWaitClose = false;
+            g_psdState = PSD_CLOSING;
+            g_psdStateUntilMs = currentTimeMs + (int)(g_psdCloseTime * 1000.0f);
+            if (g_psdSoundClose >= 0) sound[g_psdSoundClose] = ATS_SOUND_PLAY;
+        }
+        else if (g_psdState == PSD_OPENING && currentTimeMs >= g_psdStateUntilMs) {
+            g_psdState = PSD_OPEN;
+        }
+        else if (g_psdState == PSD_CLOSING && currentTimeMs >= g_psdStateUntilMs) {
+            g_psdState = PSD_CLOSED;
+        }
+        if (currentTimeMs < g_psdStateUntilMs - 600000) g_psdStateUntilMs = currentTimeMs; // 時刻が大きく戻ったとき(駅ジャンプ)
+    }
+    // 回生失効の表示灯
+    if (g_regenFailPanel >= 0) panel[g_regenFailPanel] = g_regenFail ? 1 : 0;
+    // 分けた画像のメーター(速度計): 画像 j は 値 j*PerPart 〜 (j+1)*PerPart-1 を受け持つ
+    //   値より前の画像は最後のコマ(全部点灯)、値を受け持つ画像はその値のコマ、値より後の画像は空のコマ
+    if (g_splitPanel >= 0) {
+        int v = (int)fabsf(vehicleState.Speed);   // BVE の kmph と同じく、小数点以下は切り捨て
+        for (int j = 0; j < g_splitParts; j++) {
+            int first = j * g_splitPerPart;
+            int last = first + g_splitPerPart - 1;
+            int f;
+            if (v < first) f = 0;
+            else if (v > last) f = g_splitPerPart;
+            else f = v - first + 1;
+            panel[g_splitPanel + j] = f;
+        }
+    }
+    // 母線引き通し表示灯: M車の集電靴が1つでもサードレールのない区間に入っていれば消灯
+    if (g_busEnable) {
+        float front = (float)vehicleState.Location;
+        float maxShoe = 0.0f;
+        for (int s = 0; s < g_busShoeCount; s++) if (g_busShoes[s] > maxShoe) maxShoe = g_busShoes[s];
+        bool off = false;
+        for (int k = 0; k < g_busGapCount; k++) {
+            if (g_busShoeCount == 0) {           // 集電靴の位置を書いていないときは、先頭の位置で判断する
+                if (front >= g_busGapStart[k] && front < g_busGapEnd[k]) off = true;
+            }
+            for (int s = 0; s < g_busShoeCount; s++) {
+                float shoe = front - g_busShoes[s];
+                if (shoe >= g_busGapStart[k] && shoe < g_busGapEnd[k]) off = true;
+            }
+        }
+        // 最後尾の集電靴も通り過ぎた区間は消す
+        for (int k = 0; k < g_busGapCount; ) {
+            if (front - maxShoe >= g_busGapEnd[k]) {
+                g_busGapStart[k] = g_busGapStart[g_busGapCount - 1];
+                g_busGapEnd[k] = g_busGapEnd[g_busGapCount - 1];
+                g_busGapCount--;
+            }
+            else k++;
+        }
+        if (fabsf(vehicleState.Speed) < g_busOnSpeed) off = true;   // 低速・停車中は引き通さない
+        if (g_powerOutage) off = true;                               // 停電中は消灯
+        panel[g_busPanel] = off ? 0 : 1;
+    }
+    // 可動柵開ランプ: ホームドアが閉まりきっていない間(開いている途中・開・閉まっている途中)点灯
+    panel[g_psdPanelOpen] = (g_psdState != PSD_CLOSED) ? 1 : 0;
+    if (g_psdPanelState >= 0) panel[g_psdPanelState] = g_psdState;
 
     // 現在駅・次駅 (号線ごとに4つ: 下り現在・下り次・上り現在・上り次)。選択中の号線と方向だけ駅番号を出し、ほかは0(非表示)
     for (int i = 0; i < 40; i++) panel[g_stnPanelStart + i] = 0;
@@ -1478,11 +1773,14 @@ ATS_API void WINAPI KeyUp(int key) {
 ATS_API void WINAPI DoorOpen()
 {
     g_isDoorOpen = true;
+    g_psdDoorOpenEvent = true;   // ホームドア: 次の Elapse で開く準備
     OnDoorOpen();
 	ATOOnDoorOpen();
 }
 ATS_API void WINAPI DoorClose() {
 	g_isDoorOpen = false;
+	g_psdDoorCloseEvent = true;  // ホームドア: 次の Elapse で閉まる準備
+	g_psdInstant = false;
 	TascOnDoorClose(); // 転動防止ブレーキ(INIの設定でドアが閉まったら緩める)
 	ATOOnDoorClose();
 }
@@ -1502,6 +1800,14 @@ ATS_API void WINAPI Initialize(int key)
 	TascArmHold(); // 止まっていれば、TASC/ATOモードにしたとき転動防止ブレーキを掛ける
 	ATOOnInitialize(); // 駅ジャンプ後も、ドアが閉まったら自動発進できるようにする
 	g_psdStationHas = g_psdDefault; // 駅ジャンプでは1040を通らないので、INIの DefaultStation に戻す
+	g_busGapCount = 0; // 母線引き通し: 駅ジャンプしたら、覚えていた区間を消す
+	g_powerOutage = false; // 停電: 駅ジャンプしたら復旧した状態から始める(停電区間の地上子が届けば、また停電になる)
+	// ホームドア: 駅ジャンプ直後は、車両のドアが開いていれば動きなしで開いた状態にする
+	g_psdInstant = true;
+	g_psdWaitOpen = g_psdWaitClose = false;
+	g_psdState = PSD_CLOSED;
+	g_psdStateUntilMs = 0;
+	if (g_isDoorOpen) g_psdDoorOpenEvent = true;
 	s_ptLastTimeMs = -1; // パネルの更新間隔・反映遅延: 駅ジャンプのあとは、すぐに今の値を表示する
 	if (g_isInNagataStation) {
 		g_isInNagataStation = false; // 長田駅エリアフラグをリセット
